@@ -4,3 +4,4 @@ playwright
 Flask
 google-auth-oauthlib
 gunicorn
+google-generativeai
