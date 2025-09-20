@@ -3,3 +3,4 @@ googlemaps
 playwright
 Flask
 google-auth-oauthlib
+gunicorn
