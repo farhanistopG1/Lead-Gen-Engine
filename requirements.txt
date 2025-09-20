@@ -1,0 +1,5 @@
+gspread
+googlemaps
+playwright
+Flask
+google-auth-oauthlib
