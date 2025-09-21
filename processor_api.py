@@ -16,6 +16,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def run_processor_script():
+    # --- Part 1: Connect to Google Sheets & Find Tasks ---
     try:
         gc = gspread.service_account(filename="gspread_credentials.json")
         spreadsheet = gc.open(SPREADSHEET_NAME)
@@ -67,12 +68,12 @@ def run_processor_script():
 
         # --- Part 3: The AI "Chain" ---
         try:
-            prompt1 = f\"\"\"
+            prompt1 = f"""
             Analyze the raw HTML of {target_url}. Perform two tasks:
             TASK 1: Extract Data (About Us, Phone, Email, Social Media).
             TASK 2: Provide a Strategic Analysis of 3 critical website flaws.
             HTML: {body_html}
-            \"\"\"
+            """
             response1 = model.generate_content(prompt1)
             flaw_analysis = response1.text
             
