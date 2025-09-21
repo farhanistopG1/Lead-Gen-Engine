@@ -9,8 +9,6 @@ import time
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-GSPREAD_JSON_STRING = os.environ.get('GSPREAD_JSON')
-GSPREAD_CREDENTIALS = json.loads(GSPREAD_JSON_STRING)
 SPREADSHEET_NAME = "Lead Gen Engine"
 MAX_LEADS_PER_RUN = 3
 
@@ -20,7 +18,7 @@ app = Flask(__name__)
 def run_processor_script():
     # --- Part 1: Connect to Google Sheets & Find Tasks ---
     try:
-        gc = gspread.service_account_from_dict(GSPREAD_CREDENTIALS)
+        gc = gspread.service_account(filename="gspread_credentials.json")
         spreadsheet = gc.open(SPREADSHEET_NAME)
         leads_worksheet = spreadsheet.worksheet("LEADS")
         results_worksheet = spreadsheet.worksheet("RESULTS")
