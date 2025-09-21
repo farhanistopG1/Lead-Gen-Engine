@@ -8,10 +8,8 @@ import json
 # --- CONFIGURATION ---
 # The script will read your keys from Render's Environment Variables
 MAPS_API_KEY = os.environ.get('MAPS_API_KEY')
-GSPREAD_JSON_STRING = os.environ.get('GSPREAD_JSON')
 
 # Convert the JSON string from secrets into a dictionary
-GSPREAD_CREDENTIALS = json.loads(GSPREAD_JSON_STRING)
 
 SPREADSHEET_NAME = "Lead Gen Engine"
 SEARCH_QUERY = "restaurants in Indiranagar Bengaluru"
@@ -24,7 +22,7 @@ app = Flask(__name__)
 def run_hunter_script():
     # --- Part 1: Connect to Google Sheets ---
     try:
-        gc = gspread.service_account_from_dict(GSPREAD_CREDENTIALS)
+        gc = gspread.service_account(filename="gspread_credentials.json")
         leads_worksheet = gc.open(SPREADSHEET_NAME).worksheet("LEADS")
         existing_names = set(leads_worksheet.col_values(1))
     except Exception as e:
