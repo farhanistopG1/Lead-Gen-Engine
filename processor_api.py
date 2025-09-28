@@ -1,15 +1,13 @@
 from playwright.sync_api import sync_playwright
-from google.generativeai import Client as genai_client
+import google.generativeai as genai
 import gspread
 import os
-import time
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
-MAX_LEADS_PER_RUN = 1  # Only 1 lead per run
 
-# --- Initialize Sheets ---
+# --- Initialize Google Sheets ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
 creds_path = os.path.join(script_dir, 'gspread_credentials.json')
 gc = gspread.service_account(filename=creds_path)
@@ -17,9 +15,9 @@ spreadsheet = gc.open(SPREADSHEET_NAME)
 leads_ws = spreadsheet.worksheet("LEADS")
 results_ws = spreadsheet.worksheet("RESULTS")
 
-# --- Initialize Gemini ---
-genai = genai_client(api_key=GEMINI_API_KEY)
-model = "gemini-2.5-flash"
+# --- Configure Gemini ---
+genai.configure(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-2.5-flash"
 
 # --- Fetch first pending lead ---
 all_leads = leads_ws.get_all_records()
@@ -36,11 +34,11 @@ if not lead_to_process:
 restaurant_name = lead_to_process["Restaurant Name"]
 target_url = lead_to_process["Website URL"]
 
-# --- Mark as 'Processing' immediately to avoid duplicates ---
+# --- Mark as Processing immediately ---
 try:
     cell = leads_ws.find(restaurant_name)
     target_row = cell.row
-    leads_ws.update_cell(target_row, 6, "Processing")  # Column 6 is Status
+    leads_ws.update_cell(target_row, 6, "Processing")  # Column 6 = Status
 except Exception as e:
     print(f"Error finding/updating lead: {e}")
     exit(1)
@@ -69,7 +67,7 @@ try:
     and provide 3 strategic website improvements.
     HTML: {body_html}
     """
-    response = genai.generate_content(model=model, prompt=prompt)
+    response = genai.generate_content(model=MODEL_NAME, prompt=prompt)
     analysis_text = response.text
 
     # --- Append results to RESULTS sheet ---
