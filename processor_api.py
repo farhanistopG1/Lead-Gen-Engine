@@ -7,7 +7,7 @@ import time
 
 # --- CONFIGURATION ---
 # IMPORTANT: Paste your Gemini API Key here
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 MAX_LEADS_PER_RUN = 3 # How many leads to process each time the script runs
 
