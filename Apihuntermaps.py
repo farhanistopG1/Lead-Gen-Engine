@@ -8,7 +8,8 @@ import json
 import sys
 
 # --- CONFIGURATION ---
-MAPS_API_KEY = os.environ.get('MAPS_API_KEY')
+# IMPORTANT: Paste your actual Google Maps API Key here
+MAPS_API_KEY = "AIzaSyAFEkAM6hSaXQg-ofipKlrtO_RmpK4qAW8"
 SPREADSHEET_NAME = "Lead Gen Engine"
 
 app = Flask(__name__)
@@ -23,10 +24,20 @@ def run_hunter_script():
 def find_leads(search_query):
     # This is the core logic, now in a reusable function
     try:
-        gc = gspread.service_account(filename="gspread_credentials.json")
+        # FIX 1: Use an absolute path for the credentials file
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        creds_path = os.path.join(script_dir, 'gspread_credentials.json')
+        gc = gspread.service_account(filename=creds_path)
+        
         leads_worksheet = gc.open(SPREADSHEET_NAME).worksheet("LEADS")
         existing_names = set(leads_worksheet.col_values(1))
+        
+        # FIX 2: Check if the API key is provided
+        if not MAPS_API_KEY or MAPS_API_KEY == "YOUR_GOOGLE_MAPS_API_KEY":
+            print("Error: Google Maps API key is missing from the script.")
+            return 0
         gmaps = googlemaps.Client(key=MAPS_API_KEY)
+        
     except Exception as e:
         print(f"Error during initialization: {e}")
         return 0
