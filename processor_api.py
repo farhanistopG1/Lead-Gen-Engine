@@ -5,7 +5,7 @@ import os
 import time
 
 # ---------------- CONFIG ----------------
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 SHEET_UPDATE_DELAY = 1  # seconds between sheet updates to avoid rate limits
 
