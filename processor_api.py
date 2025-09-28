@@ -1,104 +1,85 @@
 from playwright.sync_api import sync_playwright
-import google.generativeai as genai
+from google.generativeai import Client as genai_client
 import gspread
 import os
 import time
 
-# ---------------- CONFIG ----------------
+# --- CONFIGURATION ---
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
-MAX_LEADS_PER_RUN = 3
-SHEET_UPDATE_DELAY = 1  # seconds between sheet updates to avoid rate limits
+MAX_LEADS_PER_RUN = 1  # Only 1 lead per run
 
-# ---------------- CONNECT TO SHEETS ----------------
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    creds_path = os.path.join(script_dir, 'gspread_credentials.json')
-    gc = gspread.service_account(filename=creds_path)
-    spreadsheet = gc.open(SPREADSHEET_NAME)
-    leads_worksheet = spreadsheet.worksheet("LEADS")
-    results_worksheet = spreadsheet.worksheet("RESULTS")
-except Exception as e:
-    print(f"Error connecting to Google Sheets: {e}")
-    exit(1)
+# --- Initialize Sheets ---
+script_dir = os.path.dirname(os.path.abspath(__file__))
+creds_path = os.path.join(script_dir, 'gspread_credentials.json')
+gc = gspread.service_account(filename=creds_path)
+spreadsheet = gc.open(SPREADSHEET_NAME)
+leads_ws = spreadsheet.worksheet("LEADS")
+results_ws = spreadsheet.worksheet("RESULTS")
 
-# ---------------- CONFIGURE GEMINI ----------------
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash")
-except Exception as e:
-    print(f"Error configuring Gemini client: {e}")
-    exit(1)
+# --- Initialize Gemini ---
+genai = genai_client(api_key=GEMINI_API_KEY)
+model = "gemini-2.5-flash"
 
-# ---------------- GET PENDING LEADS ----------------
-all_leads = leads_worksheet.get_all_records()
-leads_to_process = [lead for lead in all_leads if str(lead.get("Status")).strip() == "Pending"]
+# --- Fetch first pending lead ---
+all_leads = leads_ws.get_all_records()
+lead_to_process = None
+for lead in all_leads:
+    if str(lead.get("Status")).strip().lower() == "pending":
+        lead_to_process = lead
+        break
 
-if not leads_to_process:
+if not lead_to_process:
     print("No pending leads found.")
     exit(0)
 
-processed_count = 0
+restaurant_name = lead_to_process["Restaurant Name"]
+target_url = lead_to_process["Website URL"]
 
-# ---------------- PROCESS LEADS ----------------
-for idx, lead in enumerate(leads_to_process, start=2):  # start=2 to match sheet row numbers
-    if processed_count >= MAX_LEADS_PER_RUN:
-        break
+# --- Mark as 'Processing' immediately to avoid duplicates ---
+try:
+    cell = leads_ws.find(restaurant_name)
+    target_row = cell.row
+    leads_ws.update_cell(target_row, 6, "Processing")  # Column 6 is Status
+except Exception as e:
+    print(f"Error finding/updating lead: {e}")
+    exit(1)
 
-    restaurant_name = lead["Restaurant Name"]
-    target_url = lead.get("Website URL", "").strip()
+print(f"Processing lead: {restaurant_name}")
 
-    if not target_url or target_url.lower() in ["no website found", ""]:
-        leads_worksheet.update_cell(idx, 6, "Processing Error - Scraping Failed")
-        continue
-
-    print(f"--- Processing Lead: {restaurant_name} ---")
-
-    # ---- SCRAPE WEBSITE ----
-    body_html = ""
+# --- Scrape Website ---
+body_html = ""
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            try:
-                page.goto(target_url, timeout=60000)
-                body_html = page.locator("body").inner_html()
-            except Exception as e:
-                print(f"Error scraping {target_url}: {e}")
-                leads_worksheet.update_cell(idx, 6, "Processing Error - Scraping Failed")
-                continue
-            finally:
-                browser.close()
+        page.goto(target_url, timeout=60000)
+        body_html = page.locator("body").inner_html()
     except Exception as e:
-        print(f"Playwright error for {target_url}: {e}")
-        leads_worksheet.update_cell(idx, 6, "Processing Error - Scraping Failed")
-        continue
+        print(f"Error scraping {target_url}: {e}")
+        leads_ws.update_cell(target_row, 6, "Scraping Failed")
+        exit(1)
+    finally:
+        browser.close()
 
-    # ---- AI ANALYSIS ----
-    try:
-        prompt1 = f"""
-        Analyze the raw HTML of {target_url}. Perform two tasks:
-        TASK 1: Extract Data (About Us, Phone, Email, Social Media).
-        TASK 2: Provide a Strategic Analysis of 3 critical website flaws.
-        HTML: {body_html}
-        """
-        response1 = model.generate_content(prompt1)
-        flaw_analysis = response1.text
+# --- AI Analysis ---
+try:
+    prompt = f"""
+    Analyze the HTML of {target_url}. Extract contact info (phone, email, socials)
+    and provide 3 strategic website improvements.
+    HTML: {body_html}
+    """
+    response = genai.generate_content(model=model, prompt=prompt)
+    analysis_text = response.text
 
-        prompt2 = f"""Based on the following website analysis, generate a detailed prompt for an AI website builder.
-ANALYSIS: {flaw_analysis}"""
-        response2 = model.generate_content(prompt2)
-        builder_prompt = response2.text
+    # --- Append results to RESULTS sheet ---
+    results_ws.append_row([restaurant_name, analysis_text, "", "", ""])
 
-        # ---- LOG TO SHEETS ----
-        results_worksheet.append_row([restaurant_name, flaw_analysis, builder_prompt, "", ""])
-        leads_worksheet.update_cell(idx, 6, "Analysis Complete")
-        processed_count += 1
-        print(f"✅ Successfully processed {restaurant_name}")
-        time.sleep(SHEET_UPDATE_DELAY)
-    except Exception as e:
-        print(f"Error during AI chain or sheet update for {restaurant_name}: {e}")
-        leads_worksheet.update_cell(idx, 6, "Processing Error - AI Failed")
-        continue
+    # --- Mark lead as Complete ---
+    leads_ws.update_cell(target_row, 6, "Complete")
+    print(f"✅ Successfully processed {restaurant_name}")
 
-print(f"Processor run complete! Processed {processed_count} leads.")
+except Exception as e:
+    print(f"AI processing failed for {restaurant_name}: {e}")
+    leads_ws.update_cell(target_row, 6, "AI Failed")
+    exit(1)
