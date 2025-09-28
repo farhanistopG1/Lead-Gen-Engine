@@ -1,3 +1,4 @@
+
 from flask import Flask
 from playwright.sync_api import sync_playwright
 import google.generativeai as genai
@@ -8,7 +9,8 @@ import re
 import time
 
 # --- CONFIGURATION ---
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+# FIX 1: Add your Gemini API key directly here
+GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 MAX_LEADS_PER_RUN = 3
 
@@ -18,7 +20,11 @@ app = Flask(__name__)
 def run_processor_script():
     # --- Part 1: Connect to Google Sheets & Find Tasks ---
     try:
-        gc = gspread.service_account(filename="gspread_credentials.json")
+        # FIX 2: Use an absolute path for the credentials file
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        creds_path = os.path.join(script_dir, 'gspread_credentials.json')
+        gc = gspread.service_account(filename=creds_path)
+        
         spreadsheet = gc.open(SPREADSHEET_NAME)
         leads_worksheet = spreadsheet.worksheet("LEADS")
         results_worksheet = spreadsheet.worksheet("RESULTS")
@@ -31,8 +37,12 @@ def run_processor_script():
     if not leads_to_process:
         return "No pending leads found."
         
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Configure the Gemini client
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+    except Exception as e:
+        return f"Error configuring Gemini client. Is your API key correct? Error: {e}"
     
     processed_count = 0
     for lead in leads_to_process:
@@ -82,9 +92,7 @@ def run_processor_script():
             builder_prompt = response2.text
 
             # --- Part 4: Log to Sheets ---
-            if not results_worksheet.get_all_values():
-                 results_worksheet.append_row(["Restaurant Name", "Flaw Analysis", "Builder Prompt"])
-            results_worksheet.append_row([restaurant_name, flaw_analysis, builder_prompt])
+            results_worksheet.append_row([restaurant_name, flaw_analysis, builder_prompt, "", ""]) # Added empty cells for new columns
             
             leads_worksheet.update_cell(target_row_number, 6, "Analysis Complete")
             processed_count += 1
@@ -97,4 +105,5 @@ def run_processor_script():
     return f"Processor run complete! Processed {processed_count} leads."
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    # We changed the port to 10001 earlier
+    app.run(host='0.0.0.0', port=10001)
