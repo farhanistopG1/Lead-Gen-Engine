@@ -1,4 +1,4 @@
-
+# --- Filename: processor_api.py ---
 from flask import Flask
 from playwright.sync_api import sync_playwright
 import google.generativeai as genai
@@ -9,18 +9,20 @@ import re
 import time
 
 # --- CONFIGURATION ---
-# FIX 1: Add your Gemini API key directly here
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 MAX_LEADS_PER_RUN = 3
 
+# Flask app is defined but not run when triggered by n8n
 app = Flask(__name__)
 
-@app.route('/')
 def run_processor_script():
+    """
+    This is the main function that runs the entire lead processing logic.
+    """
     # --- Part 1: Connect to Google Sheets & Find Tasks ---
     try:
-        # FIX 2: Use an absolute path for the credentials file
+        # Use an absolute path for the credentials file
         script_dir = os.path.dirname(os.path.abspath(__file__))
         creds_path = os.path.join(script_dir, 'gspread_credentials.json')
         gc = gspread.service_account(filename=creds_path)
@@ -29,20 +31,23 @@ def run_processor_script():
         leads_worksheet = spreadsheet.worksheet("LEADS")
         results_worksheet = spreadsheet.worksheet("RESULTS")
     except Exception as e:
-        return f"Error connecting to Google Sheets: {e}"
+        print(f"Error connecting to Google Sheets: {e}")
+        return
 
     all_leads = leads_worksheet.get_all_records()
     leads_to_process = [lead for lead in all_leads if str(lead.get('Status')).strip() == 'Pending']
     
     if not leads_to_process:
-        return "No pending leads found."
+        print("No pending leads found.")
+        return
         
     # Configure the Gemini client
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
     except Exception as e:
-        return f"Error configuring Gemini client. Is your API key correct? Error: {e}"
+        print(f"Error configuring Gemini client. Is your API key correct? Error: {e}")
+        return
     
     processed_count = 0
     for lead in leads_to_process:
@@ -63,18 +68,17 @@ def run_processor_script():
 
         # --- Part 2: Scrape the Website ---
         body_html = ""
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            try:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
                 page.goto(target_url, timeout=60000)
                 body_html = page.locator('body').inner_html()
-            except Exception as e:
-                print(f"Error scraping {target_url}: {e}")
-                leads_worksheet.update_cell(target_row_number, 6, "Processing Error - Scraping Failed")
-                continue
-            finally:
                 browser.close()
+        except Exception as e:
+            print(f"Error scraping {target_url}: {e}")
+            leads_worksheet.update_cell(target_row_number, 6, "Processing Error - Scraping Failed")
+            continue
 
         # --- Part 3: The AI "Chain" ---
         try:
@@ -92,7 +96,7 @@ def run_processor_script():
             builder_prompt = response2.text
 
             # --- Part 4: Log to Sheets ---
-            results_worksheet.append_row([restaurant_name, flaw_analysis, builder_prompt, "", ""]) # Added empty cells for new columns
+            results_worksheet.append_row([restaurant_name, flaw_analysis, builder_prompt, "", ""])
             
             leads_worksheet.update_cell(target_row_number, 6, "Analysis Complete")
             processed_count += 1
@@ -102,8 +106,10 @@ def run_processor_script():
             leads_worksheet.update_cell(target_row_number, 6, "Processing Error - AI Failed")
             continue
 
-    return f"Processor run complete! Processed {processed_count} leads."
+    print(f"Processor run complete! Processed {processed_count} leads.")
 
+# --- THIS IS THE CRITICAL CHANGE ---
 if __name__ == '__main__':
-    # We changed the port to 10001 earlier
-    app.run(host='0.0.0.0', port=10001)
+    # When this script is run directly from the command line (by n8n),
+    # it will now execute the main function instead of starting a web server.
+    run_processor_script()
