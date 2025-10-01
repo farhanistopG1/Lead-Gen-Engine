@@ -1,15 +1,14 @@
-# --- Filename: master_control.py (Final Version) ---
+# --- Filename: master_control.py (Final, Robust Version) ---
 import gspread
 import subprocess
 import sys
 import os
-import time # --- FIX: Import the time module ---
+import time
 
 # --- CONFIGURATION ---
 SPREADSHEET_NAME = "Lead Gen Engine"
 
 def main():
-    # Get credentials path and connect to sheets
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         creds_path = os.path.join(script_dir, 'gspread_credentials.json')
@@ -18,34 +17,37 @@ def main():
         campaigns_worksheet = spreadsheet.worksheet("CAMPAIGNS")
     except Exception as e:
         print(f"Error connecting to Google Sheets: {e}")
-        time.sleep(60) # Wait before exiting on error
+        time.sleep(60) # Wait before retry on connection error
         return
 
     all_campaigns = campaigns_worksheet.get_all_records()
     active_campaign = None
     active_campaign_row = None
     
+    # This loop now correctly finds the first valid, unprocessed campaign
     for i, campaign in enumerate(all_campaigns):
-        if campaign.get('Status', '').strip() == '':
-            active_campaign = campaign
-            active_campaign_row = i + 2
-            break
+        status = campaign.get('Status', '').strip()
+        area = campaign.get('Area', '').strip()
+        
+        # If area is empty OR status is NOT empty, skip to the next row
+        if not area or status:
+            continue
+            
+        # If we reach here, we've found a valid campaign to run
+        active_campaign = campaign
+        active_campaign_row = i + 2
+        break # Exit the loop, we only want to run one campaign
     
-    # --- FIX: Add a pause if no campaigns are found ---
+    # This block only runs if the loop finished and NO campaigns were found
     if not active_campaign:
         print("🎉 All campaigns are complete! Waiting 60 seconds before checking again...")
-        time.sleep(60) # Pauses for 60 seconds to prevent API rate limiting
+        time.sleep(60)
         return
-    # --- FIX END ---
     
-    campaign_query = active_campaign.get('Area', '')
-    if not campaign_query:
-        print(f"Skipping row {active_campaign_row}, 'Area' is empty.")
-        return
-
-    print(f"🎯 Running Campaign: {campaign_query}")
-
-    # Run the hunter script
+    # --- The rest of your script remains the same ---
+    campaign_query = active_campaign['Area']
+    print(f"🎯 Running Campaign: {campaign_query} (Row: {active_campaign_row})")
+    
     python_path = sys.executable
     hunter_script = os.path.join(script_dir, "Apihuntermaps.py")
         
@@ -59,7 +61,7 @@ def main():
         campaigns_worksheet.update_cell(active_campaign_row, 2, "Complete")
         
     except Exception as e:
-        print(f"❌ Error running hunter script: {e}")
+        print(f"❌ Error during hunter subprocess: {e}")
         campaigns_worksheet.update_cell(active_campaign_row, 2, "Error - Check Logs")
 
     print("Master Control cycle complete.")
