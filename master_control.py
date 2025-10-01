@@ -1,12 +1,12 @@
-# --- Filename: master_control_simple.py ---
+# --- Filename: master_control.py (Final Version) ---
 """
 Simple Master Control - Runs each campaign once
-No lead counting needed since each specific query gets good results
 """
 import gspread
 import subprocess
 import sys
 import os
+import time # --- FIX: Import the time module ---
 
 # --- CONFIGURATION ---
 SPREADSHEET_NAME = "Lead Gen Engine"
@@ -29,27 +29,26 @@ def main():
     active_campaign_row = None
     
     for i, campaign in enumerate(all_campaigns):
-        # Check if Status is empty
         status = campaign.get('Status', '').strip()
         area = campaign.get('Area', '').strip()
         
         # Skip if Area is empty or Status is not empty
-        if not area:
+        if not area or status:
             continue
-        if status:  # Already has a status (Complete, etc)
-            continue
-        
+            
         # Found an active campaign!
         active_campaign = campaign
         active_campaign_row = i + 2  # +2 for header row and 0-indexing
         break
     
-    # Check if we found a campaign
+    # --- FIX START: Add a pause if no campaigns are found ---
     if not active_campaign:
         print("=" * 60)
-        print("🎉 All campaigns are complete!")
+        print("🎉 All campaigns are complete! Waiting 60 seconds before checking again...")
         print("=" * 60)
+        time.sleep(60) # Pauses for 60 seconds to prevent API rate limiting
         return
+    # --- FIX END ---
     
     # Get campaign details
     campaign_query = active_campaign['Area']
@@ -96,15 +95,4 @@ def main():
             print(f"   Output: {e.stdout}")
         if e.stderr:
             print(f"   Error: {e.stderr}")
-        campaigns_worksheet.update_cell(active_campaign_row, 2, "Error - Check Logs")
-        
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        campaigns_worksheet.update_cell(active_campaign_row, 2, "Error")
-    
-    print("\n" + "=" * 60)
-    print("Master Control Complete")
-    print("=" * 60)
-
-if __name__ == "__main__":
-    main()
+        campaigns_worksheet.update_cell
