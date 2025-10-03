@@ -10,13 +10,13 @@ from datetime import datetime, timedelta
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
-SHEET_UPDATE_DELAY = 5  # Much longer delay to avoid rate limits
+SHEET_UPDATE_DELAY = 5
 MAX_LEADS_PER_DAY = 3
 MIN_DELAY_MINUTES = 10
 MAX_DELAY_MINUTES = 20
 TRACKING_FILE = "daily_processing_log.json"
 CACHE_FILE = "sheets_cache.json"
-CACHE_DURATION = 300  # 5 minutes cache
+CACHE_DURATION = 300
 MAX_RETRIES = 5
 BASE_BACKOFF = 10
 
@@ -57,8 +57,6 @@ cache = SheetsCache()
 
 # ---------------- RATE LIMIT SAFE OPERATIONS ----------------
 def safe_sheet_read(operation, operation_name, cache_key=None, max_retries=MAX_RETRIES):
-    """Read operations with aggressive caching"""
-    # Check cache first
     if cache_key:
         cached = cache.get(cache_key)
         if cached is not None:
@@ -69,7 +67,7 @@ def safe_sheet_read(operation, operation_name, cache_key=None, max_retries=MAX_R
             result = operation()
             if cache_key:
                 cache.set(cache_key, result)
-            time.sleep(2)  # Always wait 2s after successful read
+            time.sleep(2)
             return result
         except gspread.exceptions.APIError as e:
             if '429' in str(e):
@@ -86,12 +84,11 @@ def safe_sheet_read(operation, operation_name, cache_key=None, max_retries=MAX_R
     raise Exception(f"Failed {operation_name} after {max_retries} attempts")
 
 def safe_sheet_write(operation, operation_name, max_retries=MAX_RETRIES):
-    """Write operations with exponential backoff"""
     for attempt in range(max_retries):
         try:
             result = operation()
-            time.sleep(SHEET_UPDATE_DELAY)  # Long delay after writes
-            cache.cache = {}  # Invalidate all cache after write
+            time.sleep(SHEET_UPDATE_DELAY)
+            cache.cache = {}
             cache.save_cache()
             return result
         except gspread.exceptions.APIError as e:
@@ -153,71 +150,152 @@ except Exception as e:
     print(f"FATAL: Error configuring Gemini: {e}")
     exit(1)
 
-# ---------------- DUPLICATE DETECTION & CLEANUP ----------------
+# ---------------- PHONE NUMBER UTILITIES ----------------
 def normalize_phone(phone):
     """Normalize phone number for comparison"""
     if not phone:
         return ""
-    return ''.join(filter(str.isdigit, str(phone)))[-10:]  # Last 10 digits
+    return ''.join(filter(str.isdigit, str(phone)))[-10:]
 
-def clean_duplicates_in_results():
-    """Remove duplicate entries from RESULTS sheet, keeping unique phone numbers"""
-    print("\n=== STARTING DUPLICATE CLEANUP ===")
+def get_phone_from_leads(restaurant_name):
+    """Fetch phone number from LEADS sheet by restaurant name"""
+    try:
+        leads_data = safe_sheet_read(
+            lambda: leads_worksheet.get_all_records(),
+            "Reading LEADS for phone lookup",
+            "leads_phone_lookup"
+        )
+        
+        name_lower = restaurant_name.strip().lower()
+        for lead in leads_data:
+            lead_name = str(lead.get("Restaurant Name", "")).strip().lower()
+            if lead_name == name_lower:
+                phone = str(lead.get("Phone Number", "")).strip()
+                return phone if phone else "No Number"
+        
+        return "No Number"
+    except Exception as e:
+        print(f"Error fetching phone from LEADS: {e}")
+        return "No Number"
+
+# ---------------- PHONE NUMBER SYNC ----------------
+def sync_phone_numbers_from_leads():
+    """Sync all phone numbers from LEADS to RESULTS"""
+    print("\n=== SYNCING PHONE NUMBERS FROM LEADS ===")
     
     try:
+        # Get RESULTS data
         results_data = safe_sheet_read(
             lambda: results_worksheet.get_all_records(),
-            "Reading RESULTS for cleanup",
-            "results_all"
+            "Reading RESULTS for phone sync",
+            "results_phone_sync"
         )
         
         if not results_data:
             print("No data in RESULTS sheet")
             return
         
-        # Track unique entries by (name, phone) combination
+        # Get LEADS data
+        leads_data = safe_sheet_read(
+            lambda: leads_worksheet.get_all_records(),
+            "Reading LEADS for phone sync",
+            "leads_phone_sync"
+        )
+        
+        # Build lookup: restaurant name -> phone number
+        leads_lookup = {}
+        for lead in leads_data:
+            name = str(lead.get("Restaurant Name", "")).strip().lower()
+            phone = str(lead.get("Phone Number", "")).strip()
+            leads_lookup[name] = phone if phone else "No Number"
+        
+        # Update RESULTS where phone is missing or incorrect
+        updates_made = 0
+        for idx, result_row in enumerate(results_data):
+            row_num = idx + 2  # Account for header
+            restaurant_name = str(result_row.get("Restaurant Name", "")).strip()
+            current_phone = str(result_row.get("Phone Number", "")).strip()
+            
+            name_lower = restaurant_name.lower()
+            correct_phone = leads_lookup.get(name_lower, "No Number")
+            
+            # Update if phone is missing or different
+            if not current_phone or current_phone != correct_phone:
+                print(f"Updating phone for '{restaurant_name}' (Row {row_num}): {correct_phone}")
+                try:
+                    safe_sheet_write(
+                        lambda: results_worksheet.update_cell(row_num, 6, correct_phone),
+                        f"Syncing phone to F{row_num}"
+                    )
+                    updates_made += 1
+                except Exception as e:
+                    print(f"Failed to update phone for row {row_num}: {e}")
+        
+        if updates_made > 0:
+            print(f"\nSynced {updates_made} phone numbers from LEADS to RESULTS")
+        else:
+            print("All phone numbers already in sync")
+        
+        print("=== PHONE SYNC COMPLETE ===\n")
+        
+    except Exception as e:
+        print(f"Error during phone sync: {e}")
+
+# ---------------- DUPLICATE CLEANUP ----------------
+def clean_duplicates_in_results():
+    """Remove duplicate entries from RESULTS sheet"""
+    print("\n=== STARTING DUPLICATE CLEANUP ===")
+    
+    try:
+        results_data = safe_sheet_read(
+            lambda: results_worksheet.get_all_records(),
+            "Reading RESULTS for cleanup",
+            "results_cleanup"
+        )
+        
+        if not results_data:
+            print("No data in RESULTS sheet")
+            return
+        
         seen = {}
         rows_to_delete = []
         
         for idx, row in enumerate(results_data):
-            row_num = idx + 2  # Account for header
+            row_num = idx + 2
             name = str(row.get("Restaurant Name", "")).strip().lower()
             phone = normalize_phone(row.get("Phone Number", ""))
             
             key = f"{name}|{phone}"
             
             if key in seen:
-                print(f"DUPLICATE FOUND: {row.get('Restaurant Name')} (Row {row_num}) - Same name and phone as Row {seen[key]}")
+                print(f"DUPLICATE: {row.get('Restaurant Name')} (Row {row_num}) - Same as Row {seen[key]}")
                 rows_to_delete.append(row_num)
             else:
                 seen[key] = row_num
         
-        # Delete duplicates in reverse order to maintain row numbers
         if rows_to_delete:
             print(f"\nDeleting {len(rows_to_delete)} duplicate rows...")
             for row_num in sorted(rows_to_delete, reverse=True):
                 try:
                     safe_sheet_write(
                         lambda: results_worksheet.delete_rows(row_num),
-                        f"Deleting duplicate row {row_num}"
+                        f"Deleting row {row_num}"
                     )
                     print(f"Deleted row {row_num}")
-                    time.sleep(SHEET_UPDATE_DELAY)  # Extra delay between deletes
                 except Exception as e:
                     print(f"Failed to delete row {row_num}: {e}")
             
-            print(f"\nCleaned {len(rows_to_delete)} duplicates from RESULTS")
+            print(f"\nCleaned {len(rows_to_delete)} duplicates")
         else:
-            print("No duplicates found in RESULTS")
+            print("No duplicates found")
         
         print("=== DUPLICATE CLEANUP COMPLETE ===\n")
         
     except Exception as e:
-        print(f"Error during duplicate cleanup: {e}")
-        print("Continuing with processing anyway...")
+        print(f"Error during cleanup: {e}")
 
 def get_results_lookup():
-    """Build efficient lookup of processed leads"""
+    """Build lookup of processed leads"""
     try:
         results_data = safe_sheet_read(
             lambda: results_worksheet.get_all_records(),
@@ -234,14 +312,13 @@ def get_results_lookup():
         
         return lookup
     except Exception as e:
-        print(f"Error building results lookup: {e}")
+        print(f"Error building lookup: {e}")
         return {}
 
 # ---------------- MAIN PROCESSING ----------------
 def process_single_lead():
-    """Process one lead with full error handling"""
+    """Process one lead"""
     
-    # Get all leads (with caching)
     try:
         all_leads = safe_sheet_read(
             lambda: leads_worksheet.get_all_records(),
@@ -252,10 +329,8 @@ def process_single_lead():
         print(f"Failed to fetch leads: {e}")
         return False
     
-    # Build results lookup once
     results_lookup = get_results_lookup()
     
-    # Find first valid pending lead
     for idx, lead in enumerate(all_leads):
         status = str(lead.get("Status", "")).strip().lower()
         restaurant_name = str(lead.get("Restaurant Name", "")).strip()
@@ -263,44 +338,40 @@ def process_single_lead():
         phone_normalized = normalize_phone(phone_raw)
         
         if status == "pending":
-            # Check if already processed
             lookup_key = f"{restaurant_name.lower()}|{phone_normalized}"
             
             if lookup_key in results_lookup:
-                print(f"SKIP: {restaurant_name} already processed (duplicate)")
+                print(f"SKIP: {restaurant_name} already processed")
                 row_index = idx + 2
                 try:
                     safe_sheet_write(
                         lambda: leads_worksheet.update_cell(row_index, 6, "Complete"),
-                        "Marking duplicate as complete"
+                        "Marking duplicate complete"
                     )
                 except:
                     pass
                 continue
             
-            # This is a valid lead to process
             lead_row_index = idx + 2
             target_url = lead.get("Website URL", "").strip()
             
             print(f"\n--- Processing: {restaurant_name} (Row {lead_row_index}) ---")
             
-            # Validate URL
             if not target_url or target_url.lower() in ["no website found", ""]:
-                print(f"Invalid URL for {restaurant_name}")
+                print(f"Invalid URL")
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - No Valid URL"),
                     "Updating invalid URL status"
                 )
                 return False
             
-            # Mark as processing
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             safe_sheet_write(
                 lambda: leads_worksheet.update_cell(lead_row_index, 6, f"Processing... {timestamp}"),
                 "Marking as processing"
             )
             
-            # Scrape website
+            # Scrape
             try:
                 print(f"Scraping: {target_url}")
                 with sync_playwright() as p:
@@ -333,7 +404,7 @@ HTML: {body_html}"""
                 flaw_analysis = response1.text
                 print(f"Completed flaw analysis")
                 
-                time.sleep(3)  # Delay between AI calls
+                time.sleep(3)
                 
                 prompt2 = f"""Based on the following website analysis, generate a detailed prompt for an AI website builder.
 ANALYSIS: {flaw_analysis}"""
@@ -342,31 +413,34 @@ ANALYSIS: {flaw_analysis}"""
                 builder_prompt = response2.text
                 print(f"Generated builder prompt")
                 
-                # Final duplicate check before saving
+                # Final duplicate check
                 results_lookup = get_results_lookup()
                 if lookup_key in results_lookup:
-                    print(f"DUPLICATE detected during processing, aborting")
+                    print(f"DUPLICATE detected, aborting")
                     safe_sheet_write(
                         lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                         "Marking duplicate complete"
                     )
                     return False
                 
-                # Save to RESULTS
+                # Determine phone number to save
+                phone_to_save = phone_raw if phone_raw else "No Number"
+                
+                # Save to RESULTS (6 columns: Name, Analysis, Prompt, Status, URL, Phone)
                 print(f"Saving results...")
                 safe_sheet_write(
                     lambda: results_worksheet.append_row([
-                        restaurant_name, 
-                        flaw_analysis, 
-                        builder_prompt, 
-                        "", 
-                        "",
-                        phone_raw
+                        restaurant_name,   # A
+                        flaw_analysis,     # B
+                        builder_prompt,    # C
+                        "",               # D (Outreach Status)
+                        "",               # E (Preview URL)
+                        phone_to_save     # F (Phone Number)
                     ]),
                     "Appending to RESULTS"
                 )
                 
-                # Mark complete in LEADS
+                # Mark complete
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                     "Marking lead complete"
@@ -387,13 +461,14 @@ ANALYSIS: {flaw_analysis}"""
     return False
 
 # ---------------- MAIN LOOP ----------------
-print("Starting Ultra-Robust Lead Processor")
+print("Starting Intelligent Lead Processor")
 print(f"Daily Limit: {MAX_LEADS_PER_DAY} leads")
-print(f"Delay: {MIN_DELAY_MINUTES}-{MAX_DELAY_MINUTES} minutes between leads")
+print(f"Delay: {MIN_DELAY_MINUTES}-{MAX_DELAY_MINUTES} minutes")
 print("=" * 60)
 
-# Clean duplicates on startup
+# STARTUP TASKS
 clean_duplicates_in_results()
+sync_phone_numbers_from_leads()
 
 while True:
     try:
@@ -417,15 +492,13 @@ while True:
             save_daily_log(daily_log)
             
             remaining = MAX_LEADS_PER_DAY - daily_log["processed_count"]
-            print(f"Progress: {daily_log['processed_count']}/{MAX_LEADS_PER_DAY} leads")
-            print(f"Remaining: {remaining} leads")
+            print(f"Progress: {daily_log['processed_count']}/{MAX_LEADS_PER_DAY}")
+            print(f"Remaining: {remaining}")
             
             if remaining > 0:
                 delay_minutes = random.randint(MIN_DELAY_MINUTES, MAX_DELAY_MINUTES)
-                print(f"Waiting {delay_minutes} minutes before next lead...")
+                print(f"Waiting {delay_minutes} minutes...")
                 time.sleep(delay_minutes * 60)
-            else:
-                print(f"Daily quota complete!")
         else:
             print("Waiting 30 minutes before retry...")
             time.sleep(1800)
@@ -435,7 +508,7 @@ while True:
         break
     except Exception as e:
         print(f"Unexpected error: {e}")
-        print("Waiting 10 minutes before retry...")
+        print("Waiting 10 minutes...")
         time.sleep(600)
 
 print("\nProcessor stopped")
