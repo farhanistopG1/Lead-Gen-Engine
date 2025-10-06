@@ -150,47 +150,71 @@ except Exception as e:
     print(f"FATAL: Error configuring Gemini: {e}")
     exit(1)
 
-# ---------------- NORMALIZATION (CRITICAL FOR DUPLICATE DETECTION) ----------------
+# ---------------- NORMALIZATION ----------------
 def normalize_text(text):
-    """Normalize text for comparison - removes extra spaces, lowercases"""
+    """Aggressive text normalization"""
     if not text:
         return ""
-    return ' '.join(str(text).strip().lower().split())
+    # Remove all non-alphanumeric except spaces, convert to lowercase
+    import re
+    cleaned = re.sub(r'[^a-z0-9\s]', '', str(text).lower())
+    # Remove extra spaces
+    return ' '.join(cleaned.split())
 
 def normalize_phone(phone):
-    """Normalize phone number - extracts last 10 digits"""
+    """Extract last 10 digits from phone number"""
     if not phone:
         return ""
     digits = ''.join(filter(str.isdigit, str(phone)))
     return digits[-10:] if len(digits) >= 10 else digits
 
+# ---------------- UNIFIED DUPLICATE KEY ----------------
+def create_duplicate_key(name, phone):
+    """
+    Create a unique key for duplicate detection.
+    Priority: phone > name
+    """
+    name_norm = normalize_text(name)
+    phone_norm = normalize_phone(phone)
+    
+    # If phone exists, use phone as primary key
+    if phone_norm and len(phone_norm) == 10:
+        return f"phone:{phone_norm}"
+    
+    # Otherwise use name
+    if name_norm:
+        return f"name:{name_norm}"
+    
+    return None
+
 # ---------------- PHONE NUMBER SYNC ----------------
 def sync_phone_numbers_from_leads():
-    print("\n=== SYNCING PHONE NUMBERS FROM LEADS ===")
+    print("\n=== SYNCING PHONE NUMBERS ===")
     
     try:
         results_data = safe_sheet_read(
             lambda: results_worksheet.get_all_records(),
-            "Reading RESULTS for phone sync",
-            None  # Don't cache during sync
+            "Reading RESULTS for sync",
+            None
         )
         
         if not results_data:
-            print("No data in RESULTS sheet")
+            print("No data in RESULTS")
             return
         
         leads_data = safe_sheet_read(
             lambda: leads_worksheet.get_all_records(),
-            "Reading LEADS for phone sync",
-            None  # Don't cache during sync
+            "Reading LEADS for sync",
+            None
         )
         
         # Build lookup with normalized names
         leads_lookup = {}
         for lead in leads_data:
-            name_normalized = normalize_text(lead.get("Restaurant Name", ""))
+            name_norm = normalize_text(lead.get("Restaurant Name", ""))
             phone = str(lead.get("Phone Number", "")).strip()
-            leads_lookup[name_normalized] = phone if phone else "No Number"
+            if name_norm:
+                leads_lookup[name_norm] = phone if phone else "No Number"
         
         updates_made = 0
         for idx, result_row in enumerate(results_data):
@@ -198,11 +222,11 @@ def sync_phone_numbers_from_leads():
             restaurant_name = str(result_row.get("Restaurant Name", "")).strip()
             current_phone = str(result_row.get("Phone Number", "")).strip()
             
-            name_normalized = normalize_text(restaurant_name)
-            correct_phone = leads_lookup.get(name_normalized, "No Number")
+            name_norm = normalize_text(restaurant_name)
+            correct_phone = leads_lookup.get(name_norm, "No Number")
             
             if not current_phone or current_phone != correct_phone:
-                print(f"Updating phone for '{restaurant_name}' (Row {row_num}): {correct_phone}")
+                print(f"Row {row_num}: '{restaurant_name}' → {correct_phone}")
                 try:
                     safe_sheet_write(
                         lambda: results_worksheet.update_cell(row_num, 6, correct_phone),
@@ -210,27 +234,23 @@ def sync_phone_numbers_from_leads():
                     )
                     updates_made += 1
                 except Exception as e:
-                    print(f"Failed to update phone for row {row_num}: {e}")
+                    print(f"Failed row {row_num}: {e}")
         
-        if updates_made > 0:
-            print(f"\nSynced {updates_made} phone numbers")
-        else:
-            print("All phone numbers in sync")
-        
-        print("=== PHONE SYNC COMPLETE ===\n")
+        print(f"Synced {updates_made} phones" if updates_made else "All phones in sync")
+        print("=== SYNC COMPLETE ===\n")
         
     except Exception as e:
-        print(f"Error during phone sync: {e}")
+        print(f"Sync error: {e}")
 
-# ---------------- ENHANCED DUPLICATE CLEANUP ----------------
+# ---------------- CLEANUP WITH UNIFIED LOGIC ----------------
 def clean_duplicates_in_results():
-    print("\n=== CLEANING DUPLICATES IN RESULTS ===")
+    print("\n=== CLEANING DUPLICATES ===")
     
     try:
         results_data = safe_sheet_read(
             lambda: results_worksheet.get_all_records(),
             "Reading RESULTS for cleanup",
-            None  # Fresh read
+            None
         )
         
         if not results_data:
@@ -242,20 +262,22 @@ def clean_duplicates_in_results():
         
         for idx, row in enumerate(results_data):
             row_num = idx + 2
-            name_normalized = normalize_text(row.get("Restaurant Name", ""))
-            phone_normalized = normalize_phone(row.get("Phone Number", ""))
+            name = str(row.get("Restaurant Name", "")).strip()
+            phone = str(row.get("Phone Number", "")).strip()
             
-            # Create unique key: prioritize phone, fall back to name
-            if phone_normalized:
-                key = f"phone:{phone_normalized}"
-            else:
-                key = f"name:{name_normalized}"
+            # Use unified duplicate key
+            dup_key = create_duplicate_key(name, phone)
             
-            if key in seen:
-                print(f"DUPLICATE: {row.get('Restaurant Name')} (Row {row_num}) - matches Row {seen[key]}")
+            if not dup_key:
+                print(f"Row {row_num}: No valid name or phone - skipping")
+                continue
+            
+            if dup_key in seen:
+                print(f"DUPLICATE: {name} (Row {row_num}) matches Row {seen[dup_key]}")
+                print(f"  Key: {dup_key}")
                 rows_to_delete.append(row_num)
             else:
-                seen[key] = row_num
+                seen[dup_key] = row_num
         
         if rows_to_delete:
             print(f"\nDeleting {len(rows_to_delete)} duplicates...")
@@ -268,49 +290,51 @@ def clean_duplicates_in_results():
                     print(f"Deleted row {row_num}")
                 except Exception as e:
                     print(f"Failed to delete row {row_num}: {e}")
-            
-            print(f"Cleaned {len(rows_to_delete)} duplicates")
         else:
             print("No duplicates found")
         
         print("=== CLEANUP COMPLETE ===\n")
         
     except Exception as e:
-        print(f"Error during cleanup: {e}")
+        print(f"Cleanup error: {e}")
 
-# ---------------- DUPLICATE CHECK (BEFORE PROCESSING) ----------------
+# ---------------- DUPLICATE CHECK WITH UNIFIED LOGIC ----------------
 def is_already_processed(restaurant_name, phone_raw):
-    """Check if lead already exists in RESULTS - NO CACHE"""
+    """Check if lead exists in RESULTS using unified key matching"""
     try:
         results_data = safe_sheet_read(
             lambda: results_worksheet.get_all_records(),
-            "Checking for duplicates",
-            None  # CRITICAL: No cache for duplicate checks
+            "Checking duplicates",
+            None  # No cache
         )
         
-        name_normalized = normalize_text(restaurant_name)
-        phone_normalized = normalize_phone(phone_raw)
+        # Create key for new lead
+        new_key = create_duplicate_key(restaurant_name, phone_raw)
         
+        if not new_key:
+            print(f"  ! WARNING: No valid name or phone for duplicate check")
+            return False
+        
+        # Check against all existing entries
         for row in results_data:
-            existing_name = normalize_text(row.get("Restaurant Name", ""))
-            existing_phone = normalize_phone(row.get("Phone Number", ""))
+            existing_name = str(row.get("Restaurant Name", "")).strip()
+            existing_phone = str(row.get("Phone Number", "")).strip()
             
-            # Match on phone first (more reliable)
-            if phone_normalized and existing_phone and phone_normalized == existing_phone:
-                print(f"  ✗ DUPLICATE: Phone {phone_normalized} already exists")
-                return True
+            existing_key = create_duplicate_key(existing_name, existing_phone)
             
-            # Match on name if phone unavailable
-            if name_normalized and existing_name and name_normalized == existing_name:
-                print(f"  ✗ DUPLICATE: Name '{restaurant_name}' already exists")
+            if existing_key and new_key == existing_key:
+                print(f"  ✗ DUPLICATE FOUND")
+                print(f"    New: {restaurant_name} | {phone_raw}")
+                print(f"    Existing: {existing_name} | {existing_phone}")
+                print(f"    Match key: {new_key}")
                 return True
         
-        print(f"  ✓ NEW: Not found in RESULTS")
+        print(f"  ✓ NEW (Key: {new_key})")
         return False
         
     except Exception as e:
-        print(f"Error checking duplicates: {e}")
-        return False  # If check fails, allow processing (better than blocking)
+        print(f"Duplicate check error: {e}")
+        return False
 
 # ---------------- MAIN PROCESSING ----------------
 def process_single_lead():
@@ -334,7 +358,7 @@ def process_single_lead():
             
             print(f"\n--- Checking: {restaurant_name} (Row {lead_row_index}) ---")
             
-            # CRITICAL: Check duplicates BEFORE any processing
+            # DUPLICATE CHECK
             if is_already_processed(restaurant_name, phone_raw):
                 print(f"SKIP: Already in RESULTS")
                 try:
@@ -404,10 +428,10 @@ ANALYSIS: {flaw_analysis}"""
                 builder_prompt = response2.text
                 print(f"Generated builder prompt")
                 
-                # FINAL CHECK: One more duplicate check right before saving
-                print("Final duplicate check before saving...")
+                # FINAL DUPLICATE CHECK
+                print("Final duplicate check...")
                 if is_already_processed(restaurant_name, phone_raw):
-                    print(f"DUPLICATE detected in final check - aborting")
+                    print(f"DUPLICATE in final check - aborting")
                     safe_sheet_write(
                         lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                         "Marking duplicate complete"
