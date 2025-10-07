@@ -5,3 +5,4 @@ Flask
 google-auth-oauthlib
 gunicorn
 google-generativeai
+beautifulsoup4
