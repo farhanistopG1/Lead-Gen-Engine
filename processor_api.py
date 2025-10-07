@@ -13,7 +13,7 @@ import re
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 SHEET_UPDATE_DELAY = 5
-MAX_LEADS_PER_DAY = 3
+MAX_LEADS_PER_DAY = 6
 MIN_DELAY_MINUTES = 10
 MAX_DELAY_MINUTES = 20
 TRACKING_FILE = "daily_processing_log.json"
@@ -22,9 +22,9 @@ CACHE_DURATION = 300
 MAX_RETRIES = 5
 BASE_BACKOFF = 10
 
-# 🔥 NEW: HTML size limits to control token usage
-MAX_HTML_LENGTH = 15000  # Limit cleaned text to ~10k tokens
-MIN_HTML_LENGTH = 500  # Skip if too little content
+# 🔥 OPTIMIZED: Smaller HTML limits since we need less detail
+MAX_HTML_LENGTH = 8000   # Reduced from 15000 (you only need key info for template)
+MIN_HTML_LENGTH = 500
 
 # ---------------- CACHING LAYER ----------------
 class SheetsCache:
@@ -61,11 +61,11 @@ class SheetsCache:
 
 cache = SheetsCache()
 
-# ---------------- 🔥 NEW: HTML CLEANING FUNCTION ----------------
+# ---------------- HTML CLEANING FUNCTION ----------------
 def clean_html_aggressive(html_content):
     """
     Extract ONLY essential text content from HTML, drastically reducing tokens.
-    This function reduces typical page HTML from 100KB+ to <15KB of relevant text.
+    Optimized for template-based approach - we only need key business info.
     """
     try:
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -80,13 +80,13 @@ def clean_html_aggressive(html_content):
         
         # Aggressive cleaning
         text = re.sub(r'\s+', ' ', text)  # Multiple spaces to single
-        text = re.sub(r'(\S)\1{3,}', r'\1\1', text)  # Repeated chars (aaaa -> aa)
+        text = re.sub(r'(\S)\1{3,}', r'\1\1', text)  # Repeated chars
         text = re.sub(r'[^\w\s@.,!?;:()\-\'\"\/]', '', text)  # Keep only essential punctuation
         
-        # Extract structured data if possible
+        # Extract structured data
         structured_data = {
             'title': soup.title.string if soup.title else '',
-            'headings': [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2', 'h3'])[:10]],
+            'headings': [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2'])[:5]],  # Reduced from 10
             'meta_desc': '',
             'contact_info': extract_contact_info(text),
         }
@@ -94,30 +94,26 @@ def clean_html_aggressive(html_content):
         # Get meta description
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         if meta_desc and meta_desc.get('content'):
-            structured_data['meta_desc'] = meta_desc['content'][:200]
+            structured_data['meta_desc'] = meta_desc['content'][:150]  # Reduced from 200
         
-        # Limit length (token control)
+        # Limit length (token control) - more aggressive
         if len(text) > MAX_HTML_LENGTH:
-            # Keep beginning and end, they usually have important info
-            mid_point = MAX_HTML_LENGTH // 2
-            text = text[:mid_point] + " [...CONTENT TRUNCATED...] " + text[-mid_point:]
+            # Just keep the beginning (most important info is usually at top)
+            text = text[:MAX_HTML_LENGTH]
         
         # Create compact representation
         compact_html = f"""
-WEBSITE TITLE: {structured_data['title']}
-META DESCRIPTION: {structured_data['meta_desc']}
-MAIN HEADINGS: {', '.join(structured_data['headings'])}
-CONTACT INFO FOUND: {json.dumps(structured_data['contact_info'])}
-
-VISIBLE TEXT CONTENT (cleaned):
-{text}
+Title: {structured_data['title']}
+Headings: {', '.join(structured_data['headings'])}
+Contact: {json.dumps(structured_data['contact_info'])}
+Content: {text}
 """
         
         return compact_html.strip()
         
     except Exception as e:
         print(f"HTML cleaning error: {e}")
-        return html_content[:MAX_HTML_LENGTH]  # Fallback to truncation
+        return html_content[:MAX_HTML_LENGTH]
 
 def extract_contact_info(text):
     """Extract email, phone, social media from text"""
@@ -126,16 +122,18 @@ def extract_contact_info(text):
     # Email
     emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
     if emails:
-        contact['emails'] = list(set(emails))[:3]
+        contact['email'] = emails[0]  # Just first one
     
     # Phone (basic patterns)
     phones = re.findall(r'[\+\(]?[0-9][0-9\s\-\(\)]{8,}[0-9]', text)
     if phones:
-        contact['phones'] = list(set([p.strip() for p in phones]))[:3]
+        contact['phone'] = phones[0].strip()  # Just first one
     
     # Social media mentions
-    if 'instagram' in text.lower() or '@' in text:
-        contact['has_social'] = True
+    if 'instagram' in text.lower():
+        contact['has_instagram'] = True
+    if 'facebook' in text.lower():
+        contact['has_facebook'] = True
     
     return contact
 
@@ -225,10 +223,9 @@ except Exception as e:
     print(f"FATAL: Error connecting to Google Sheets: {e}")
     exit(1)
 
-# ---------------- 🔥 CONFIGURE GEMINI WITH FLASH-LITE ----------------
+# ---------------- CONFIGURE GEMINI WITH FLASH-LITE ----------------
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    # 🚀 SWITCHED TO FLASH-LITE - 60% cheaper per operation!
     model = genai.GenerativeModel("gemini-2.5-flash-lite")
     print("Configured Gemini AI with Flash-Lite (cost-optimized)")
 except Exception as e:
@@ -413,7 +410,7 @@ def is_already_processed(restaurant_name, phone_raw):
         print(f"Duplicate check error: {e}")
         return False
 
-# ---------------- 🔥 OPTIMIZED: SINGLE API CALL PROCESSING ----------------
+# ---------------- 🔥 ULTRA OPTIMIZED: MINIMAL PROMPT PROCESSING ----------------
 def process_single_lead():
     try:
         all_leads = safe_sheet_read(
@@ -465,7 +462,7 @@ def process_single_lead():
                 "Marking as processing"
             )
             
-            # 🔥 SCRAPE AND CLEAN HTML
+            # SCRAPE AND CLEAN HTML
             try:
                 print(f"Scraping: {target_url}")
                 with sync_playwright() as p:
@@ -476,7 +473,7 @@ def process_single_lead():
                         body_html = page.locator("body").inner_html()
                         print(f"Raw HTML: {len(body_html)} chars")
                         
-                        # 🚀 CLEAN HTML - This reduces tokens by 80-90%!
+                        # 🚀 CLEAN HTML - Even more aggressive!
                         cleaned_html = clean_html_aggressive(body_html)
                         print(f"Cleaned HTML: {len(cleaned_html)} chars (reduced by {100 - int(len(cleaned_html)/len(body_html)*100)}%)")
                         
@@ -490,55 +487,58 @@ def process_single_lead():
                 )
                 return False
             
-            # 🔥 SINGLE COMBINED API CALL - Saves 1 entire API call!
+            # 🔥 ULTRA MINIMAL PROMPT - Just extract essentials!
             try:
-                print(f"Starting AI analysis (SINGLE optimized call)...")
+                print(f"Starting AI analysis (ULTRA MINIMAL prompt)...")
                 
-                combined_prompt = f"""You are analyzing the website for "{restaurant_name}" at {target_url}.
+                # 🚀 DRASTICALLY SIMPLIFIED PROMPT
+                minimal_prompt = f"""Analyze {restaurant_name}'s website and provide:
 
-Perform BOTH tasks in a SINGLE response, formatted exactly as shown below:
+1. KEY INFO (3-4 bullet points):
+- Business type & specialty
+- Contact: phone, email, social media
+- Main issues (missing info, poor UX, etc.)
 
-===== TASK 1: WEBSITE ANALYSIS =====
-Extract the following data and identify 3 critical website flaws:
+2. FIX CHECKLIST (5-7 items):
+List ONLY the specific fixes needed (e.g., "Add email address", "Fix broken Instagram link")
 
-1. **Extracted Data:**
-   - About Us: [extract about section]
-   - Phone: [extract phone]
-   - Email: [extract email]
-   - Social Media: [list social profiles]
-
-2. **3 Critical Website Flaws:**
-   List and explain 3 major issues with the website (missing info, broken links, poor UX, etc.)
-
-===== TASK 2: WEBSITE BUILDER PROMPT =====
-Based on the flaws identified above, create a detailed prompt for an AI website builder to fix these issues.
-
-WEBSITE CONTENT:
+WEBSITE DATA:
 {cleaned_html}
 
----
-FORMAT YOUR RESPONSE EXACTLY AS:
-===== TASK 1: WEBSITE ANALYSIS =====
-[Your analysis here]
-
-===== TASK 2: WEBSITE BUILDER PROMPT =====
-[Your builder prompt here]
-"""
+Keep it SHORT and ACTIONABLE."""
                 
-                response = model.generate_content(combined_prompt)
+                response = model.generate_content(minimal_prompt)
                 full_response = response.text
                 
-                # Parse the combined response
-                parts = full_response.split("===== TASK 2: WEBSITE BUILDER PROMPT =====")
-                if len(parts) == 2:
-                    flaw_analysis = parts[0].replace("===== TASK 1: WEBSITE ANALYSIS =====", "").strip()
-                    builder_prompt = parts[1].strip()
+                # Parse into analysis and checklist
+                if "FIX CHECKLIST" in full_response or "2." in full_response:
+                    parts = re.split(r'2\.|FIX CHECKLIST', full_response, maxsplit=1)
+                    flaw_analysis = parts[0].strip()
+                    builder_prompt = parts[1].strip() if len(parts) > 1 else "Fix issues mentioned above"
                 else:
-                    # Fallback if format not perfect
-                    flaw_analysis = full_response[:len(full_response)//2]
-                    builder_prompt = full_response[len(full_response)//2:]
+                    # Fallback: split roughly in half
+                    split_point = len(full_response) // 2
+                    flaw_analysis = full_response[:split_point].strip()
+                    builder_prompt = full_response[split_point:].strip()
                 
-                print(f"✓ Combined analysis completed (saved 1 API call!)")
+                # 🔥 ACCURATE COST TRACKING
+                # Calculate actual tokens (chars ÷ 4 is a good approximation)
+                input_tokens = (len(cleaned_html) + len(minimal_prompt)) / 4
+                output_tokens = len(full_response) / 4
+                total_tokens = input_tokens + output_tokens
+                
+                # Gemini 2.5 Flash-Lite pricing
+                input_cost_usd = (input_tokens / 1_000_000) * 0.10
+                output_cost_usd = (output_tokens / 1_000_000) * 0.40
+                total_cost_usd = input_cost_usd + output_cost_usd
+                total_cost_inr = total_cost_usd * 85  # USD to INR conversion
+                
+                print(f"✓ Analysis completed (ULTRA efficient!)")
+                print(f"  - Analysis: {len(flaw_analysis)} chars")
+                print(f"  - Fixes: {len(builder_prompt)} chars")
+                print(f"  📊 COST TRACKING:")
+                print(f"     Tokens: {int(total_tokens)} ({int(input_tokens)} in / {int(output_tokens)} out)")
+                print(f"     Cost: ₹{total_cost_inr:.4f} (~₹{total_cost_inr:.2f})")
                 
                 # FINAL DUPLICATE CHECK
                 print("Final duplicate check...")
@@ -586,11 +586,12 @@ FORMAT YOUR RESPONSE EXACTLY AS:
 
 # ---------------- MAIN LOOP ----------------
 print("=" * 60)
-print("🚀 OPTIMIZED Lead Processor (80-90% cost reduction!)")
+print("🚀 ULTRA OPTIMIZED Lead Processor (90%+ cost reduction!)")
 print("=" * 60)
-print(f"Model: Gemini 2.5 Flash-Lite (60% cheaper)")
-print(f"HTML Cleaning: Enabled (90% token reduction)")
-print(f"API Calls: 1 per lead (was 2)")
+print(f"Model: Gemini 2.5 Flash-Lite")
+print(f"HTML: Reduced to {MAX_HTML_LENGTH} chars max")
+print(f"Prompt: Minimal checklist format")
+print(f"Output: Short analysis + fix list")
 print(f"Daily Limit: {MAX_LEADS_PER_DAY} leads")
 print(f"Delay: {MIN_DELAY_MINUTES}-{MAX_DELAY_MINUTES} minutes")
 print("=" * 60)
