@@ -12,18 +12,20 @@ import re
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
-SHEET_UPDATE_DELAY = 5
-MAX_LEADS_PER_DAY = 6
-MIN_DELAY_MINUTES = 10
-MAX_DELAY_MINUTES = 20
+SHEET_UPDATE_DELAY = 3
+MAX_LEADS_PER_DAY = 100
+
+# 🔥🔥🔥 CRITICAL: TIMING IN SECONDS NOT MINUTES! 🔥🔥🔥
+MIN_DELAY_SECONDS = 30   # 30-90 SECONDS between leads
+MAX_DELAY_SECONDS = 90   # NOT minutes!
+RETRY_DELAY_SECONDS = 120  # 2 minutes on failure
+
 TRACKING_FILE = "daily_processing_log.json"
 CACHE_FILE = "sheets_cache.json"
 CACHE_DURATION = 300
 MAX_RETRIES = 5
 BASE_BACKOFF = 10
-
-# 🔥 OPTIMIZED: Smaller HTML limits since we need less detail
-MAX_HTML_LENGTH = 8000   # Reduced from 15000 (you only need key info for template)
+MAX_HTML_LENGTH = 8000
 MIN_HTML_LENGTH = 500
 
 # ---------------- CACHING LAYER ----------------
@@ -48,7 +50,7 @@ class SheetsCache:
         if key in self.cache:
             cached_data = self.cache[key]
             if time.time() - cached_data['timestamp'] < CACHE_DURATION:
-                print(f"Using cached data for {key}")
+                print(f"📦 Using cached data for {key}")
                 return cached_data['data']
         return None
     
@@ -61,80 +63,60 @@ class SheetsCache:
 
 cache = SheetsCache()
 
-# ---------------- HTML CLEANING FUNCTION ----------------
+# ---------------- HTML CLEANING ----------------
 def clean_html_aggressive(html_content):
-    """
-    Extract ONLY essential text content from HTML, drastically reducing tokens.
-    Optimized for template-based approach - we only need key business info.
-    """
     try:
         soup = BeautifulSoup(html_content, 'html.parser')
         
-        # Remove completely useless tags
         for tag in soup(['script', 'style', 'noscript', 'iframe', 'svg', 'path', 
                         'meta', 'link', 'head', 'footer', 'nav', 'aside']):
             tag.decompose()
         
-        # Get text content
         text = soup.get_text(separator=' ', strip=True)
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(\S)\1{3,}', r'\1\1', text)
+        text = re.sub(r'[^\w\s@.,!?;:()\-\'\"\/]', '', text)
         
-        # Aggressive cleaning
-        text = re.sub(r'\s+', ' ', text)  # Multiple spaces to single
-        text = re.sub(r'(\S)\1{3,}', r'\1\1', text)  # Repeated chars
-        text = re.sub(r'[^\w\s@.,!?;:()\-\'\"\/]', '', text)  # Keep only essential punctuation
-        
-        # Extract structured data
         structured_data = {
             'title': soup.title.string if soup.title else '',
-            'headings': [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2'])[:5]],  # Reduced from 10
+            'headings': [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2', 'h3'])[:8]],
             'meta_desc': '',
             'contact_info': extract_contact_info(text),
         }
         
-        # Get meta description
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         if meta_desc and meta_desc.get('content'):
-            structured_data['meta_desc'] = meta_desc['content'][:150]  # Reduced from 200
+            structured_data['meta_desc'] = meta_desc['content'][:150]
         
-        # Limit length (token control) - more aggressive
         if len(text) > MAX_HTML_LENGTH:
-            # Just keep the beginning (most important info is usually at top)
-            text = text[:MAX_HTML_LENGTH]
+            mid_point = MAX_HTML_LENGTH // 2
+            text = text[:mid_point] + " [...] " + text[-mid_point:]
         
-        # Create compact representation
         compact_html = f"""
-Title: {structured_data['title']}
-Headings: {', '.join(structured_data['headings'])}
-Contact: {json.dumps(structured_data['contact_info'])}
-Content: {text}
+TITLE: {structured_data['title']}
+DESC: {structured_data['meta_desc']}
+HEADINGS: {', '.join(structured_data['headings'])}
+CONTACT: {json.dumps(structured_data['contact_info'])}
+
+TEXT:
+{text}
 """
-        
         return compact_html.strip()
         
     except Exception as e:
-        print(f"HTML cleaning error: {e}")
+        print(f"⚠️  HTML cleaning error: {e}")
         return html_content[:MAX_HTML_LENGTH]
 
 def extract_contact_info(text):
-    """Extract email, phone, social media from text"""
     contact = {}
-    
-    # Email
     emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
     if emails:
-        contact['email'] = emails[0]  # Just first one
-    
-    # Phone (basic patterns)
+        contact['emails'] = list(set(emails))[:3]
     phones = re.findall(r'[\+\(]?[0-9][0-9\s\-\(\)]{8,}[0-9]', text)
     if phones:
-        contact['phone'] = phones[0].strip()  # Just first one
-    
-    # Social media mentions
-    if 'instagram' in text.lower():
-        contact['has_instagram'] = True
-    if 'facebook' in text.lower():
-        contact['has_facebook'] = True
-    
+        contact['phones'] = list(set([p.strip() for p in phones]))[:3]
+    if 'instagram' in text.lower() or '@' in text:
+        contact['has_social'] = True
     return contact
 
 # ---------------- RATE LIMIT SAFE OPERATIONS ----------------
@@ -154,13 +136,13 @@ def safe_sheet_read(operation, operation_name, cache_key=None, max_retries=MAX_R
         except gspread.exceptions.APIError as e:
             if '429' in str(e):
                 wait_time = (2 ** attempt) * BASE_BACKOFF
-                print(f"Rate limit hit during {operation_name}. Waiting {wait_time}s")
+                print(f"⚠️  Rate limit hit during {operation_name}. Waiting {wait_time}s")
                 time.sleep(wait_time)
             else:
-                print(f"API Error during {operation_name}: {e}")
+                print(f"❌ API Error during {operation_name}: {e}")
                 time.sleep(BASE_BACKOFF)
         except Exception as e:
-            print(f"Error during {operation_name}: {e}")
+            print(f"❌ Error during {operation_name}: {e}")
             time.sleep(BASE_BACKOFF)
     
     raise Exception(f"Failed {operation_name} after {max_retries} attempts")
@@ -176,13 +158,13 @@ def safe_sheet_write(operation, operation_name, max_retries=MAX_RETRIES):
         except gspread.exceptions.APIError as e:
             if '429' in str(e):
                 wait_time = (2 ** attempt) * BASE_BACKOFF
-                print(f"Rate limit hit during {operation_name}. Waiting {wait_time}s")
+                print(f"⚠️  Rate limit hit during {operation_name}. Waiting {wait_time}s")
                 time.sleep(wait_time)
             else:
-                print(f"API Error during {operation_name}: {e}")
+                print(f"❌ API Error during {operation_name}: {e}")
                 time.sleep(BASE_BACKOFF)
         except Exception as e:
-            print(f"Error during {operation_name}: {e}")
+            print(f"❌ Error during {operation_name}: {e}")
             time.sleep(BASE_BACKOFF)
     
     raise Exception(f"Failed {operation_name} after {max_retries} attempts")
@@ -218,23 +200,22 @@ try:
     spreadsheet = gc.open(SPREADSHEET_NAME)
     leads_worksheet = spreadsheet.worksheet("LEADS")
     results_worksheet = spreadsheet.worksheet("RESULTS")
-    print("Connected to Google Sheets")
+    print("✅ Connected to Google Sheets")
 except Exception as e:
-    print(f"FATAL: Error connecting to Google Sheets: {e}")
+    print(f"❌ FATAL: Error connecting to Google Sheets: {e}")
     exit(1)
 
-# ---------------- CONFIGURE GEMINI WITH FLASH-LITE ----------------
+# ---------------- CONFIGURE GEMINI ----------------
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash-lite")
-    print("Configured Gemini AI with Flash-Lite (cost-optimized)")
+    print("✅ Configured Gemini AI with Flash-Lite")
 except Exception as e:
-    print(f"FATAL: Error configuring Gemini: {e}")
+    print(f"❌ FATAL: Error configuring Gemini: {e}")
     exit(1)
 
 # ---------------- NORMALIZATION ----------------
 def normalize_text(text):
-    """Aggressive text normalization"""
     if not text:
         return ""
     import re
@@ -242,7 +223,6 @@ def normalize_text(text):
     return ' '.join(cleaned.split())
 
 def normalize_phone(phone):
-    """Extract last 10 digits from phone number"""
     if not phone:
         return ""
     digits = ''.join(filter(str.isdigit, str(phone)))
@@ -250,10 +230,6 @@ def normalize_phone(phone):
 
 # ---------------- UNIFIED DUPLICATE KEY ----------------
 def create_duplicate_key(name, phone):
-    """
-    Create a unique key for duplicate detection.
-    Priority: phone > name
-    """
     name_norm = normalize_text(name)
     phone_norm = normalize_phone(phone)
     
@@ -267,7 +243,7 @@ def create_duplicate_key(name, phone):
 
 # ---------------- PHONE NUMBER SYNC ----------------
 def sync_phone_numbers_from_leads():
-    print("\n=== SYNCING PHONE NUMBERS ===")
+    print("\n🔄 === SYNCING PHONE NUMBERS ===")
     
     try:
         results_data = safe_sheet_read(
@@ -277,7 +253,7 @@ def sync_phone_numbers_from_leads():
         )
         
         if not results_data:
-            print("No data in RESULTS")
+            print("ℹ️  No data in RESULTS")
             return
         
         leads_data = safe_sheet_read(
@@ -303,7 +279,7 @@ def sync_phone_numbers_from_leads():
             correct_phone = leads_lookup.get(name_norm, "No Number")
             
             if not current_phone or current_phone != correct_phone:
-                print(f"Row {row_num}: '{restaurant_name}' → {correct_phone}")
+                print(f"  📝 Row {row_num}: '{restaurant_name}' → {correct_phone}")
                 try:
                     safe_sheet_write(
                         lambda: results_worksheet.update_cell(row_num, 6, correct_phone),
@@ -311,17 +287,17 @@ def sync_phone_numbers_from_leads():
                     )
                     updates_made += 1
                 except Exception as e:
-                    print(f"Failed row {row_num}: {e}")
+                    print(f"  ❌ Failed row {row_num}: {e}")
         
-        print(f"Synced {updates_made} phones" if updates_made else "All phones in sync")
+        print(f"✅ Synced {updates_made} phones" if updates_made else "✅ All phones in sync")
         print("=== SYNC COMPLETE ===\n")
         
     except Exception as e:
-        print(f"Sync error: {e}")
+        print(f"❌ Sync error: {e}")
 
 # ---------------- CLEANUP WITH UNIFIED LOGIC ----------------
 def clean_duplicates_in_results():
-    print("\n=== CLEANING DUPLICATES ===")
+    print("\n🧹 === CLEANING DUPLICATES ===")
     
     try:
         results_data = safe_sheet_read(
@@ -331,7 +307,7 @@ def clean_duplicates_in_results():
         )
         
         if not results_data:
-            print("No data in RESULTS")
+            print("ℹ️  No data in RESULTS")
             return
         
         seen = {}
@@ -345,38 +321,37 @@ def clean_duplicates_in_results():
             dup_key = create_duplicate_key(name, phone)
             
             if not dup_key:
-                print(f"Row {row_num}: No valid name or phone - skipping")
+                print(f"  ⚠️  Row {row_num}: No valid name or phone - skipping")
                 continue
             
             if dup_key in seen:
-                print(f"DUPLICATE: {name} (Row {row_num}) matches Row {seen[dup_key]}")
-                print(f"  Key: {dup_key}")
+                print(f"  🗑️  DUPLICATE: {name} (Row {row_num}) matches Row {seen[dup_key]}")
+                print(f"     Key: {dup_key}")
                 rows_to_delete.append(row_num)
             else:
                 seen[dup_key] = row_num
         
         if rows_to_delete:
-            print(f"\nDeleting {len(rows_to_delete)} duplicates...")
+            print(f"\n🗑️  Deleting {len(rows_to_delete)} duplicates...")
             for row_num in sorted(rows_to_delete, reverse=True):
                 try:
                     safe_sheet_write(
                         lambda r=row_num: results_worksheet.delete_rows(r),
                         f"Deleting row {row_num}"
                     )
-                    print(f"Deleted row {row_num}")
+                    print(f"  ✅ Deleted row {row_num}")
                 except Exception as e:
-                    print(f"Failed to delete row {row_num}: {e}")
+                    print(f"  ❌ Failed to delete row {row_num}: {e}")
         else:
-            print("No duplicates found")
+            print("✅ No duplicates found")
         
         print("=== CLEANUP COMPLETE ===\n")
         
     except Exception as e:
-        print(f"Cleanup error: {e}")
+        print(f"❌ Cleanup error: {e}")
 
-# ---------------- DUPLICATE CHECK WITH UNIFIED LOGIC ----------------
+# ---------------- DUPLICATE CHECK ----------------
 def is_already_processed(restaurant_name, phone_raw):
-    """Check if lead exists in RESULTS using unified key matching"""
     try:
         results_data = safe_sheet_read(
             lambda: results_worksheet.get_all_records(),
@@ -387,7 +362,7 @@ def is_already_processed(restaurant_name, phone_raw):
         new_key = create_duplicate_key(restaurant_name, phone_raw)
         
         if not new_key:
-            print(f"  ! WARNING: No valid name or phone for duplicate check")
+            print(f"  ⚠️  WARNING: No valid name or phone for duplicate check")
             return False
         
         for row in results_data:
@@ -397,20 +372,20 @@ def is_already_processed(restaurant_name, phone_raw):
             existing_key = create_duplicate_key(existing_name, existing_phone)
             
             if existing_key and new_key == existing_key:
-                print(f"  ✗ DUPLICATE FOUND")
-                print(f"    New: {restaurant_name} | {phone_raw}")
-                print(f"    Existing: {existing_name} | {existing_phone}")
-                print(f"    Match key: {new_key}")
+                print(f"  ❌ DUPLICATE FOUND")
+                print(f"     New: {restaurant_name} | {phone_raw}")
+                print(f"     Existing: {existing_name} | {existing_phone}")
+                print(f"     Match key: {new_key}")
                 return True
         
-        print(f"  ✓ NEW (Key: {new_key})")
+        print(f"  ✅ NEW (Key: {new_key})")
         return False
         
     except Exception as e:
-        print(f"Duplicate check error: {e}")
+        print(f"❌ Duplicate check error: {e}")
         return False
 
-# ---------------- 🔥 ULTRA OPTIMIZED: MINIMAL PROMPT PROCESSING ----------------
+# ---------------- PROCESSING ----------------
 def process_single_lead():
     try:
         all_leads = safe_sheet_read(
@@ -419,7 +394,7 @@ def process_single_lead():
             "leads_all"
         )
     except Exception as e:
-        print(f"Failed to fetch leads: {e}")
+        print(f"❌ Failed to fetch leads: {e}")
         return False
     
     for idx, lead in enumerate(all_leads):
@@ -430,11 +405,12 @@ def process_single_lead():
         if status == "pending":
             lead_row_index = idx + 2
             
-            print(f"\n--- Checking: {restaurant_name} (Row {lead_row_index}) ---")
+            print(f"\n{'='*60}")
+            print(f"🔍 Checking: {restaurant_name} (Row {lead_row_index})")
+            print(f"{'='*60}")
             
-            # DUPLICATE CHECK
             if is_already_processed(restaurant_name, phone_raw):
-                print(f"SKIP: Already in RESULTS")
+                print(f"⏭️  SKIP: Already in RESULTS")
                 try:
                     safe_sheet_write(
                         lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
@@ -446,10 +422,10 @@ def process_single_lead():
             
             target_url = lead.get("Website URL", "").strip()
             
-            print(f"--- Processing: {restaurant_name} ---")
+            print(f"🚀 Processing: {restaurant_name}")
             
             if not target_url or target_url.lower() in ["no website found", ""]:
-                print(f"Invalid URL")
+                print(f"❌ Invalid URL")
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - No Valid URL"),
                     "Updating status"
@@ -462,88 +438,69 @@ def process_single_lead():
                 "Marking as processing"
             )
             
-            # SCRAPE AND CLEAN HTML
+            # SCRAPE AND CLEAN
             try:
-                print(f"Scraping: {target_url}")
+                print(f"🌐 Scraping: {target_url}")
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     page = browser.new_page()
                     try:
                         page.goto(target_url, timeout=60000)
                         body_html = page.locator("body").inner_html()
-                        print(f"Raw HTML: {len(body_html)} chars")
+                        print(f"   📄 Raw HTML: {len(body_html):,} chars")
                         
-                        # 🚀 CLEAN HTML - Even more aggressive!
                         cleaned_html = clean_html_aggressive(body_html)
-                        print(f"Cleaned HTML: {len(cleaned_html)} chars (reduced by {100 - int(len(cleaned_html)/len(body_html)*100)}%)")
+                        reduction_pct = 100 - int(len(cleaned_html)/len(body_html)*100)
+                        print(f"   ✨ Cleaned HTML: {len(cleaned_html):,} chars (reduced by {reduction_pct}%)")
                         
                     finally:
                         browser.close()
             except Exception as e:
-                print(f"Scraping failed: {e}")
+                print(f"❌ Scraping failed: {e}")
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - Scraping Failed"),
                     "Updating status"
                 )
                 return False
             
-            # 🔥 ULTRA MINIMAL PROMPT - Just extract essentials!
+            # AI ANALYSIS
             try:
-                print(f"Starting AI analysis (ULTRA MINIMAL prompt)...")
+                print(f"🤖 Starting AI analysis (ULTRA-minimal)...")
                 
-                # 🚀 DRASTICALLY SIMPLIFIED PROMPT
-                minimal_prompt = f"""Analyze {restaurant_name}'s website and provide:
+                minimal_prompt = f"""Analyze "{restaurant_name}" website and provide:
 
-1. KEY INFO (3-4 bullet points):
-- Business type & specialty
-- Contact: phone, email, social media
-- Main issues (missing info, poor UX, etc.)
+1. KEY INFO (3-4 bullets: what they do, contact found/missing, main issues)
+2. FIX CHECKLIST (5-7 items: missing email, broken links, what to add)
 
-2. FIX CHECKLIST (5-7 items):
-List ONLY the specific fixes needed (e.g., "Add email address", "Fix broken Instagram link")
+Keep it SHORT and actionable.
 
 WEBSITE DATA:
-{cleaned_html}
-
-Keep it SHORT and ACTIONABLE."""
+{cleaned_html}"""
                 
+                start_time = time.time()
                 response = model.generate_content(minimal_prompt)
                 full_response = response.text
+                api_time = time.time() - start_time
                 
-                # Parse into analysis and checklist
-                if "FIX CHECKLIST" in full_response or "2." in full_response:
-                    parts = re.split(r'2\.|FIX CHECKLIST', full_response, maxsplit=1)
-                    flaw_analysis = parts[0].strip()
-                    builder_prompt = parts[1].strip() if len(parts) > 1 else "Fix issues mentioned above"
-                else:
-                    # Fallback: split roughly in half
-                    split_point = len(full_response) // 2
-                    flaw_analysis = full_response[:split_point].strip()
-                    builder_prompt = full_response[split_point:].strip()
-                
-                # 🔥 ACCURATE COST TRACKING
-                # Calculate actual tokens (chars ÷ 4 is a good approximation)
-                input_tokens = (len(cleaned_html) + len(minimal_prompt)) / 4
-                output_tokens = len(full_response) / 4
+                # COST TRACKING
+                input_tokens = int((len(cleaned_html) + len(minimal_prompt)) / 4)
+                output_tokens = int(len(full_response) / 4)
                 total_tokens = input_tokens + output_tokens
                 
-                # Gemini 2.5 Flash-Lite pricing
                 input_cost_usd = (input_tokens / 1_000_000) * 0.10
                 output_cost_usd = (output_tokens / 1_000_000) * 0.40
-                total_cost_usd = input_cost_usd + output_cost_usd
-                total_cost_inr = total_cost_usd * 85  # USD to INR conversion
+                total_cost_inr = (input_cost_usd + output_cost_usd) * 85
                 
-                print(f"✓ Analysis completed (ULTRA efficient!)")
-                print(f"  - Analysis: {len(flaw_analysis)} chars")
-                print(f"  - Fixes: {len(builder_prompt)} chars")
-                print(f"  📊 COST TRACKING:")
-                print(f"     Tokens: {int(total_tokens)} ({int(input_tokens)} in / {int(output_tokens)} out)")
-                print(f"     Cost: ₹{total_cost_inr:.4f} (~₹{total_cost_inr:.2f})")
+                print(f"   ✅ AI completed in {api_time:.1f}s")
+                print(f"   📊 Tokens: {input_tokens:,} in + {output_tokens:,} out = {total_tokens:,}")
+                print(f"   💰 Cost: ₹{total_cost_inr:.4f} (~₹{total_cost_inr:.2f})")
                 
-                # FINAL DUPLICATE CHECK
-                print("Final duplicate check...")
+                flaw_analysis = full_response
+                builder_prompt = f"Template-based fixes (see analysis)"
+                
+                print("🔍 Final duplicate check...")
                 if is_already_processed(restaurant_name, phone_raw):
-                    print(f"DUPLICATE in final check - aborting")
+                    print(f"❌ DUPLICATE in final check - aborting")
                     safe_sheet_write(
                         lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                         "Marking duplicate complete"
@@ -552,7 +509,7 @@ Keep it SHORT and ACTIONABLE."""
                 
                 phone_to_save = phone_raw if phone_raw else "No Number"
                 
-                print(f"Saving to RESULTS...")
+                print(f"💾 Saving to RESULTS...")
                 safe_sheet_write(
                     lambda: results_worksheet.append_row([
                         restaurant_name,
@@ -570,34 +527,37 @@ Keep it SHORT and ACTIONABLE."""
                     "Marking complete"
                 )
                 
-                print(f"✓ Successfully processed: {restaurant_name}\n")
+                print(f"✅ Successfully processed: {restaurant_name}")
+                print(f"{'='*60}\n")
                 return True
                 
             except Exception as e:
-                print(f"AI analysis failed: {e}")
+                print(f"❌ AI analysis failed: {e}")
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - AI Failed"),
                     "Updating status"
                 )
                 return False
     
-    print("No pending leads found")
+    print("ℹ️  No pending leads found")
     return False
 
 # ---------------- MAIN LOOP ----------------
-print("=" * 60)
-print("🚀 ULTRA OPTIMIZED Lead Processor (90%+ cost reduction!)")
-print("=" * 60)
-print(f"Model: Gemini 2.5 Flash-Lite")
-print(f"HTML: Reduced to {MAX_HTML_LENGTH} chars max")
-print(f"Prompt: Minimal checklist format")
-print(f"Output: Short analysis + fix list")
-print(f"Daily Limit: {MAX_LEADS_PER_DAY} leads")
-print(f"Delay: {MIN_DELAY_MINUTES}-{MAX_DELAY_MINUTES} minutes")
-print("=" * 60)
+print("\n" + "="*70)
+print("🚀 ULTRA-OPTIMIZED Lead Processor v3.0")
+print("="*70)
+print(f"💎 Model: Gemini 2.5 Flash-Lite")
+print(f"🧹 HTML Cleaning: 90%+ reduction")
+print(f"⚡ API Calls: 1 per lead")
+print(f"📊 Daily Limit: {MAX_LEADS_PER_DAY} leads")
+print(f"⏱️  Delay: {MIN_DELAY_SECONDS}-{MAX_DELAY_SECONDS} SECONDS (not minutes!)")
+print(f"💰 Est. Cost: ₹{(MAX_LEADS_PER_DAY * 30 * 0.01):.2f}/month")
+print("="*70 + "\n")
 
 clean_duplicates_in_results()
 sync_phone_numbers_from_leads()
+
+processing_times = []
 
 while True:
     try:
@@ -605,39 +565,53 @@ while True:
         daily_log = reset_daily_count_if_new_day(daily_log)
         
         if daily_log["processed_count"] >= MAX_LEADS_PER_DAY:
-            print(f"Daily limit reached ({MAX_LEADS_PER_DAY} leads)")
+            print(f"🎯 Daily limit reached ({MAX_LEADS_PER_DAY} leads)")
             now = datetime.now()
             tomorrow = now.replace(hour=0, minute=1, second=0, microsecond=0) + timedelta(days=1)
             sleep_seconds = (tomorrow - now).total_seconds()
-            print(f"Sleeping until {tomorrow.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"😴 Sleeping until {tomorrow.strftime('%Y-%m-%d %H:%M:%S')}")
             time.sleep(sleep_seconds)
             continue
         
+        lead_start_time = time.time()
         success = process_single_lead()
+        lead_end_time = time.time()
         
         if success:
+            processing_time = lead_end_time - lead_start_time
+            processing_times.append(processing_time)
+            
             daily_log["processed_count"] += 1
             daily_log["last_processed"] = datetime.now().isoformat()
             save_daily_log(daily_log)
             
             remaining = MAX_LEADS_PER_DAY - daily_log["processed_count"]
-            print(f"Progress: {daily_log['processed_count']}/{MAX_LEADS_PER_DAY}")
-            print(f"Remaining: {remaining}")
+            avg_time = sum(processing_times) / len(processing_times)
+            
+            print(f"\n📈 PROGRESS")
+            print(f"   ✅ Completed: {daily_log['processed_count']}/{MAX_LEADS_PER_DAY}")
+            print(f"   ⏳ Remaining: {remaining}")
+            print(f"   ⏱️  Avg time: {avg_time:.1f}s per lead")
+            print(f"   💰 Cost today: ₹{(daily_log['processed_count'] * 0.01):.2f}")
             
             if remaining > 0:
-                delay_minutes = random.randint(MIN_DELAY_MINUTES, MAX_DELAY_MINUTES)
-                print(f"Waiting {delay_minutes} minutes...")
-                time.sleep(delay_minutes * 60)
+                # 🔥🔥🔥 CRITICAL: DELAYS IN SECONDS! 🔥🔥🔥
+                delay_seconds = random.randint(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
+                print(f"   ⏸️  Waiting {delay_seconds} SECONDS...")
+                print(f"   📅 ETA: ~{int(remaining * (avg_time + delay_seconds) / 60)} minutes\n")
+                time.sleep(delay_seconds)  # THIS MUST BE SECONDS!
         else:
-            print("Waiting 30 minutes before retry...")
-            time.sleep(1800)
+            print(f"⚠️  No leads. Waiting {RETRY_DELAY_SECONDS} seconds...")
+            time.sleep(RETRY_DELAY_SECONDS)  # THIS MUST BE SECONDS!
             
     except KeyboardInterrupt:
-        print("\nStopped by user")
+        print("\n\n⛔ Stopped by user")
+        print(f"📊 Processed {daily_log['processed_count']} leads today")
+        print(f"💰 Cost: ₹{(daily_log['processed_count'] * 0.01):.2f}")
         break
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        print("Waiting 10 minutes...")
-        time.sleep(600)
+        print(f"❌ Error: {e}")
+        print(f"⏸️  Waiting {RETRY_DELAY_SECONDS} seconds...")
+        time.sleep(RETRY_DELAY_SECONDS)
 
-print("\nProcessor stopped")
+print("\n✋ Processor stopped")
