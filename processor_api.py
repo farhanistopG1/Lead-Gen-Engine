@@ -16,7 +16,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.2:3b"  # Perfect for 4GB RAM + 1 CPU
 SPREADSHEET_NAME = "Lead Gen Engine"
 SHEET_UPDATE_DELAY = 3
-MAX_LEADS_PER_DAY = 50
+MAX_LEADS_PER_DAY = 50  # Process MORE since it's FREE!
 MIN_DELAY_SECONDS = 15
 MAX_DELAY_SECONDS = 45
 RETRY_DELAY_SECONDS = 60
@@ -276,15 +276,12 @@ def is_already_processed(restaurant_name, phone_raw):
                 return True
         return False
     except Exception as e:
-        print(f"⚠️  Duplicate check failed (allowing): {e}")
+        print(f"⚠️  Duplicate check error (allowing): {e}")
         return False
 
 # ============================================================================
-# SUPERVISOR & PROCESSING
+# MAIN PROCESSING (OLLAMA + ICE BREAKER)
 # ============================================================================
-def generate_fallback_ice_breaker(restaurant_name):
-    return f"Hi, I noticed {restaurant_name} doesn’t have a website — that’s likely costing you 60%+ of new customers who search online. Can I show you how to fix that in under 24 hours?"
-
 def process_single_lead():
     try:
         all_leads = safe_sheet_read(
@@ -300,118 +297,104 @@ def process_single_lead():
         status = str(lead.get("Status", "")).strip().lower()
         restaurant_name = str(lead.get("Restaurant Name", "")).strip()
         phone_raw = str(lead.get("Phone Number", "")).strip()
-        if status != "pending":
-            continue
+        if status == "pending":
+            lead_row_index = idx + 2
+            print(f"\n{'='*60}")
+            print(f"🔍 Processing: {restaurant_name} (Row {lead_row_index})")
+            print(f"{'='*60}")
 
-        lead_row_index = idx + 2
-        print(f"\n{'='*60}")
-        print(f"🎯 SUPERVISOR STARTED for: {restaurant_name} (Row {lead_row_index})")
-        print(f"{'='*60}")
-
-        # === TRIPLE DUPLICATE CHECK #1 ===
-        if is_already_processed(restaurant_name, phone_raw):
-            print(f"⏭️  SKIP: Already processed (duplicate)")
-            safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
-                "Marking duplicate complete"
-            )
-            continue
-
-        target_url = lead.get("Website URL", "").strip()
-        phone_to_save = phone_raw if phone_raw else "No Number"
-
-        # Mark as processing
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        safe_sheet_write(
-            lambda: leads_worksheet.update_cell(lead_row_index, 6, f"Processing... {timestamp}"),
-            "Marking as processing"
-        )
-
-        # === HANDLE MISSING WEBSITE ===
-        if not target_url or target_url.lower() in ["no website found", "", "n/a"]:
-            print(f"⚠️  No valid website — generating fallback Ice Breaker")
-            flaw_analysis = "No website found. Cannot perform analysis."
-            builder_prompt = "Create a modern, mobile-friendly website with contact info, menu, and SEO."
-            ice_breaker = generate_fallback_ice_breaker(restaurant_name)
-
-            # === TRIPLE DUPLICATE CHECK #2 (before save) ===
+            # 🔒 DUPLICATE CHECK #1
             if is_already_processed(restaurant_name, phone_raw):
-                print(f"❌ DUPLICATE detected before save — aborting")
+                print(f"⏭️  SKIP: Already in RESULTS")
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                     "Marking duplicate complete"
                 )
                 continue
 
-            # Save full row
-            print(f"💾 Saving fallback entry...")
+            target_url = lead.get("Website URL", "").strip()
+            phone_to_save = phone_raw if phone_raw else "No Number"
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             safe_sheet_write(
-                lambda: results_worksheet.append_row([
-                    restaurant_name,         # 1
-                    flaw_analysis,           # 2
-                    builder_prompt,          # 3
-                    "",                      # 4. Outreach Status
-                    "",                      # 5. Preview URL
-                    phone_to_save,           # 6. Phone Number
-                    "",                      # 7. Message ID
-                    "",                      # 8. Last_Message_Sent
-                    "",                      # 9. Last_Message_Content
-                    "",                      # 10. Last_Reply_Received
-                    "",                      # 11. Last_Reply_Content
-                    "",                      # 12. Follow_Up_Count
-                    "",                      # 13. Auto_Acknowledge_Sent
-                    "",                      # 14. VAPI_Call_Scheduled
-                    "",                      # 15. Call_Scheduled_At
-                    ice_breaker,             # 16. Ice_Breaker ✅
-                    ""                       # 17. Source_Row
-                ]),
-                "Appending fallback to RESULTS"
+                lambda: leads_worksheet.update_cell(lead_row_index, 6, f"Processing... {timestamp}"),
+                "Marking as processing"
             )
 
-            # === TRIPLE DUPLICATE CHECK #3 (verify after write) ===
-            print("🔍 Verifying write integrity...")
-            time.sleep(3)
-            if is_already_processed(restaurant_name, phone_raw):
-                print("✅ Write verified — no duplicate created")
-            else:
-                print("⚠️  Verification inconclusive — but proceeding")
+            # === FALLBACK: NO WEBSITE ===
+            if not target_url or target_url.lower() in ["no website found", "", "n/a"]:
+                print(f"⚠️  No valid website — using fallback Ice Breaker")
+                flaw_analysis = "No website found. Cannot perform analysis."
+                builder_prompt = "Create a modern, mobile-friendly website with contact info, menu, and SEO."
+                ice_breaker = f"Hi, I noticed {restaurant_name} doesn’t have a website — that’s likely costing you 60%+ of new customers who search online. Can I show you how to fix that in under 24 hours?"
 
-            safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
-                "Marking complete"
-            )
-            print(f"✅ Fallback processed: {restaurant_name}")
-            print(f"💬 Ice Breaker: {ice_breaker}")
-            print(f"{'='*60}\n")
-            return True
+                # 🔒 DUPLICATE CHECK #2
+                if is_already_processed(restaurant_name, phone_raw):
+                    print(f"❌ DUPLICATE before save — aborting")
+                    safe_sheet_write(
+                        lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
+                        "Marking duplicate complete"
+                    )
+                    continue
 
-        # === WEBSITE EXISTS — FULL AI ANALYSIS ===
-        try:
-            print(f"🌐 Scraping: {target_url}")
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                try:
-                    page.goto(target_url, timeout=60000)
-                    body_html = page.locator("body").inner_html()
-                    print(f"   📄 Raw HTML: {len(body_html):,} chars")
-                    cleaned_html = clean_html_aggressive(body_html)
-                    reduction_pct = 100 - int(len(cleaned_html)/len(body_html)*100)
-                    print(f"   ✨ Cleaned HTML: {len(cleaned_html):,} chars (reduced by {reduction_pct}%)")
-                finally:
-                    browser.close()
-        except Exception as e:
-            print(f"❌ Scraping failed: {e}")
-            safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - Scraping Failed"),
-                "Updating status"
-            )
-            return False
+                # ✅ WRITE ALL 17 COLUMNS
+                safe_sheet_write(
+                    lambda: results_worksheet.append_row([
+                        restaurant_name,         # 1
+                        flaw_analysis,           # 2
+                        builder_prompt,          # 3
+                        "",                      # 4
+                        "",                      # 5
+                        phone_to_save,           # 6
+                        "",                      # 7
+                        "",                      # 8
+                        "",                      # 9
+                        "",                      # 10
+                        "",                      # 11
+                        "",                      # 12
+                        "",                      # 13
+                        "",                      # 14
+                        "",                      # 15
+                        ice_breaker,             # 16 ← ICE BREAKER
+                        ""                       # 17
+                    ]),
+                    "Appending fallback to RESULTS"
+                )
 
-        # === OLLAMA ANALYSIS WITH URGENT ICE BREAKER ===
-        try:
-            print(f"🤖 Starting Ollama analysis...")
-            analysis_prompt = f"""Analyze the website for "{restaurant_name}" and provide:
+                safe_sheet_write(
+                    lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
+                    "Marking complete"
+                )
+                print(f"✅ Fallback processed: {restaurant_name}")
+                print(f"💬 Ice Breaker: {ice_breaker}")
+                return True
+
+            # === FULL AI ANALYSIS WITH ICE BREAKER ===
+            try:
+                print(f"🌐 Scraping: {target_url}")
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    try:
+                        page.goto(target_url, timeout=60000)
+                        body_html = page.locator("body").inner_html()
+                        print(f"   📄 Raw HTML: {len(body_html):,} chars")
+                        cleaned_html = clean_html_aggressive(body_html)
+                        reduction_pct = 100 - int(len(cleaned_html)/len(body_html)*100)
+                        print(f"   ✨ Cleaned HTML: {len(cleaned_html):,} chars (reduced by {reduction_pct}%)")
+                    finally:
+                        browser.close()
+            except Exception as e:
+                print(f"❌ Scraping failed: {e}")
+                safe_sheet_write(
+                    lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - Scraping Failed"),
+                    "Updating status"
+                )
+                return False
+
+            try:
+                print(f"🤖 Starting Ollama analysis with urgent Ice Breaker...")
+                analysis_prompt = f"""Analyze the website for "{restaurant_name}" and provide:
 
 1. KEY INFORMATION (3-4 bullet points):
    - What the business does
@@ -430,85 +413,72 @@ def process_single_lead():
 WEBSITE DATA:
 {cleaned_html}"""
 
-            full_response = ask_ollama(analysis_prompt, max_tokens=900, temperature=0.3)
-            input_tokens = int((len(cleaned_html) + len(analysis_prompt)) / 4)
-            output_tokens = int(len(full_response) / 4)
-            print(f"   📊 ~{input_tokens:,} in + ~{output_tokens:,} out tokens")
+                full_response = ask_ollama(analysis_prompt, max_tokens=900, temperature=0.3)
 
-            # Parse Ice Breaker
-            flaw_analysis = full_response.strip()
-            ice_breaker = generate_fallback_ice_breaker(restaurant_name)
+                # Parse Ice Breaker
+                flaw_analysis = full_response.strip()
+                ice_breaker = f"Hi, I was reviewing {restaurant_name} and noticed a critical issue that’s likely costing you customers right now."
 
-            ice_match = re.search(r'ICE BREAKER[:\s]*', full_response, re.IGNORECASE)
-            if ice_match:
-                parts = re.split(r'ICE BREAKER[:\s]*', full_response, maxsplit=1, flags=re.IGNORECASE)
-                flaw_analysis = parts[0].strip()
-                ice_candidate = parts[1].strip() if len(parts) > 1 else ""
-                if ice_candidate and len(ice_candidate) > 10:
-                    ice_breaker = ice_candidate.split('\n')[0].strip()
-                    if not ice_breaker.endswith(('.', '!', '?')):
-                        ice_breaker += '.'
+                ice_match = re.search(r'ICE BREAKER[:\s]*', full_response, re.IGNORECASE)
+                if ice_match:
+                    parts = re.split(r'ICE BREAKER[:\s]*', full_response, maxsplit=1, flags=re.IGNORECASE)
+                    flaw_analysis = parts[0].strip()
+                    ice_candidate = parts[1].strip() if len(parts) > 1 else ""
+                    if ice_candidate and len(ice_candidate) > 10:
+                        ice_breaker = ice_candidate.split('\n')[0].strip()
+                        if not ice_breaker.endswith(('.', '!', '?')):
+                            ice_breaker += '.'
 
-            builder_prompt = "Template-based fixes (see analysis)"
+                builder_prompt = "Template-based fixes (see analysis)"
 
-            # === TRIPLE DUPLICATE CHECK #2 ===
-            if is_already_processed(restaurant_name, phone_raw):
-                print(f"❌ DUPLICATE before save — aborting")
+                # 🔒 DUPLICATE CHECK #2
+                if is_already_processed(restaurant_name, phone_raw):
+                    print(f"❌ DUPLICATE before save — aborting")
+                    safe_sheet_write(
+                        lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
+                        "Marking duplicate complete"
+                    )
+                    continue
+
+                # ✅ WRITE ALL 17 COLUMNS
+                safe_sheet_write(
+                    lambda: results_worksheet.append_row([
+                        restaurant_name,         # 1
+                        flaw_analysis,           # 2
+                        builder_prompt,          # 3
+                        "",                      # 4
+                        "",                      # 5
+                        phone_to_save,           # 6
+                        "",                      # 7
+                        "",                      # 8
+                        "",                      # 9
+                        "",                      # 10
+                        "",                      # 11
+                        "",                      # 12
+                        "",                      # 13
+                        "",                      # 14
+                        "",                      # 15
+                        ice_breaker,             # 16 ← ICE BREAKER
+                        ""                       # 17
+                    ]),
+                    "Appending AI result to RESULTS"
+                )
+
                 safe_sheet_write(
                     lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
-                    "Marking duplicate complete"
+                    "Marking complete"
                 )
-                continue
+                print(f"✅ AI processed: {restaurant_name}")
+                print(f"💬 Ice Breaker: {ice_breaker}")
+                return True
 
-            # Save full AI row
-            print(f"💾 Saving AI-generated entry...")
-            safe_sheet_write(
-                lambda: results_worksheet.append_row([
-                    restaurant_name,         # 1
-                    flaw_analysis,           # 2
-                    builder_prompt,          # 3
-                    "",                      # 4
-                    "",                      # 5
-                    phone_to_save,           # 6
-                    "",                      # 7
-                    "",                      # 8
-                    "",                      # 9
-                    "",                      # 10
-                    "",                      # 11
-                    "",                      # 12
-                    "",                      # 13
-                    "",                      # 14
-                    "",                      # 15
-                    ice_breaker,             # 16 ✅
-                    ""                       # 17
-                ]),
-                "Appending AI result to RESULTS"
-            )
-
-            # === TRIPLE DUPLICATE CHECK #3 ===
-            print("🔍 Verifying write integrity...")
-            time.sleep(3)
-            if is_already_processed(restaurant_name, phone_raw):
-                print("✅ Write verified")
-            else:
-                print("⚠️  Verification inconclusive")
-
-            safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
-                "Marking complete"
-            )
-            print(f"✅ AI processed: {restaurant_name}")
-            print(f"💬 Ice Breaker: {ice_breaker}")
-            print(f"{'='*60}\n")
-            return True
-
-        except Exception as e:
-            print(f"❌ Ollama analysis failed: {e}")
-            safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - AI Failed"),
-                "Updating status"
-            )
-            return False
+            except Exception as e:
+                print(f"❌ Ollama analysis failed: {e}")
+                safe_sheet_write(
+                    lambda: leads_worksheet.update_cell(lead_row_index, 6, "Processing Error - AI Failed"),
+                    "Updating status"
+                )
+                return False
 
     print("ℹ️  No pending leads found")
     return False
