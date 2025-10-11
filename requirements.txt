@@ -1,8 +1,22 @@
-gspread
-googlemaps
-playwright
-Flask
-google-auth-oauthlib
-gunicorn
-google-generativeai
-beautifulsoup4
+# Core Dependencies
+gspread==6.2.1
+playwright==1.55.0
+beautifulsoup4==4.12.3
+requests==2.32.0
+psutil==6.1.0
+
+# Google Services
+google-auth==2.37.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+googlemaps==4.10.0
+
+# Web Framework (if you're using Flask)
+Flask==3.0.3
+gunicorn==23.0.0
+
+# Optional - Remove google-generativeai if using Ollama instead
+# google-generativeai==0.8.3
+
+# HTML Parsing
+lxml==5.3.0
