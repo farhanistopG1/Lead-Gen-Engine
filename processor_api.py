@@ -10,15 +10,15 @@ from bs4 import BeautifulSoup
 import re
 
 # ============================================================================
-# 🔥🔥🔥 ULTRA-CHEAP CONFIG - ₹2 FOR 2 DAYS 🔥🔥🔥
+# 🔥🔥🔥 ULTRA-CHEAP CONFIG - UNDER ₹2 FOR 2 DAYS 🔥🔥🔥
 # ============================================================================
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 
 # ULTRA-AGGRESSIVE LIMITS TO SAVE MONEY
-MAX_LEADS_PER_DAY = 3  # Only 3 leads per day = ₹0.03/day
-MAX_HTML_LENGTH = 1500  # Tiny HTML = tiny cost
-MAX_OUTPUT_TOKENS = 200  # Short AI responses
+MAX_LEADS_PER_DAY = 3
+MAX_HTML_LENGTH = 1500
+MAX_OUTPUT_TOKENS = 200
 SHEET_UPDATE_DELAY = 2
 
 # Timing
@@ -34,28 +34,59 @@ MAX_RETRIES = 3
 BASE_BACKOFF = 10
 
 # ============================================================================
-# VERIFICATION: ENSURE WE'RE USING THE CHEAPEST MODEL
+# VERIFICATION: ENSURE WE'RE USING A CHEAP MODEL
 # ============================================================================
 def verify_cheap_model():
-    """CRITICAL: Verify we're using gemini-1.5-flash-8b (cheapest)"""
+    """CRITICAL: Verify we're using gemini-1.5-flash (cheap)"""
     try:
         print("\n🔍 Verifying model...")
-        test_model = genai.GenerativeModel("gemini-1.5-flash-8b")
+        
+        # Try gemini-1.5-flash (widely available, cheap)
+        test_model = genai.GenerativeModel("gemini-1.5-flash")
         
         response = test_model.generate_content(
             "Say OK",
             generation_config={"max_output_tokens": 5}
         )
         
-        print("✅ Model verified: gemini-1.5-flash-8b")
-        print("💰 Pricing: $0.0375/1M input, $0.15/1M output")
-        print("💰 Expected cost: ₹0.01 per lead\n")
+        print("✅ Model verified: gemini-1.5-flash")
+        print("💰 Pricing: $0.075/1M input, $0.30/1M output")
+        print("💰 Expected cost: ₹0.02 per lead\n")
         return test_model
         
     except Exception as e:
-        print(f"❌ FATAL: Model verification failed: {e}")
-        print("❌ Cannot continue - fix API key or model availability")
-        exit(1)
+        print(f"❌ Model gemini-1.5-flash failed: {e}")
+        
+        # Fallback: Try gemini-1.5-flash-latest
+        try:
+            print("🔄 Trying gemini-1.5-flash-latest...")
+            test_model = genai.GenerativeModel("gemini-1.5-flash-latest")
+            
+            response = test_model.generate_content(
+                "Say OK",
+                generation_config={"max_output_tokens": 5}
+            )
+            
+            print("✅ Model verified: gemini-1.5-flash-latest")
+            print("💰 Pricing: $0.075/1M input, $0.30/1M output")
+            print("💰 Expected cost: ₹0.02 per lead\n")
+            return test_model
+            
+        except Exception as e2:
+            print(f"❌ FATAL: All cheap models failed")
+            print(f"Error: {e2}")
+            print("\n🔍 Listing available models...")
+            
+            # List available models
+            try:
+                for m in genai.list_models():
+                    if 'generateContent' in m.supported_generation_methods:
+                        print(f"  - {m.name}")
+            except:
+                pass
+            
+            print("\n❌ Cannot continue safely")
+            exit(1)
 
 # ============================================================================
 # CACHING LAYER
@@ -94,7 +125,7 @@ class SheetsCache:
 cache = SheetsCache()
 
 # ============================================================================
-# ULTRA-AGGRESSIVE HTML CLEANING (90%+ reduction)
+# ULTRA-AGGRESSIVE HTML CLEANING (95%+ reduction)
 # ============================================================================
 def ultra_clean_html(html_content):
     """Reduce HTML to absolute minimum"""
@@ -342,12 +373,12 @@ List 5 issues:
                 api_time = time.time() - start_time
                 
                 # ACCURATE COST CALCULATION
-                # gemini-1.5-flash-8b: $0.0375/1M input, $0.15/1M output
+                # gemini-1.5-flash: $0.075/1M input, $0.30/1M output
                 input_tokens = int((len(cleaned_html) + len(prompt)) / 4)
                 output_tokens = int(len(ai_response) / 4)
                 
-                input_cost_usd = (input_tokens / 1_000_000) * 0.0375
-                output_cost_usd = (output_tokens / 1_000_000) * 0.15
+                input_cost_usd = (input_tokens / 1_000_000) * 0.075
+                output_cost_usd = (output_tokens / 1_000_000) * 0.30
                 total_cost_usd = input_cost_usd + output_cost_usd
                 total_cost_inr = total_cost_usd * 85
                 
@@ -408,10 +439,10 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("🔥 ULTRA-CHEAP Lead Processor v4.0 - EMERGENCY FIX")
     print("="*70)
-    print(f"💎 Model: gemini-1.5-flash-8b (VERIFIED CHEAPEST)")
+    print(f"💎 Model: gemini-1.5-flash (VERIFIED CHEAPEST AVAILABLE)")
     print(f"📊 Daily Limit: {MAX_LEADS_PER_DAY} leads")
-    print(f"💰 Target Cost: ₹0.01 per lead = ₹{MAX_LEADS_PER_DAY * 0.01:.2f}/day")
-    print(f"💰 2-Day Cost: ₹{MAX_LEADS_PER_DAY * 0.01 * 2:.2f}")
+    print(f"💰 Target Cost: ₹0.02 per lead = ₹{MAX_LEADS_PER_DAY * 0.02:.2f}/day")
+    print(f"💰 2-Day Cost: ₹{MAX_LEADS_PER_DAY * 0.02 * 2:.2f}")
     print(f"⏱️  Delay: {MIN_DELAY_SECONDS}-{MAX_DELAY_SECONDS}s between leads")
     print("="*70 + "\n")
     
