@@ -467,7 +467,7 @@ def process_single_lead():
    - Contact info found/missing
    - Main issues
 
-2. FIX CHECKLIST (5-7 actionable items):
+2. FIX CHECKLIST (2 main actionable points):
    - Missing contact details, broken UX, SEO issues
 
 3. ICE BREAKER:
