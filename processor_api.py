@@ -471,8 +471,7 @@ def process_single_lead():
    - Missing contact details, broken UX, SEO issues
 
 3. ICE BREAKER:
-Write a 1-2 sentence ice breaker message with URGENT tone. Make it personal and reference something specific from their site. Imply risk (lost customers, competitors winning). Make it feel time-sensitive.
-
+Write a 1-2 sentence ice breaker message with URGENT tone while mentioning you have also sent a preview link. Make it personal and reference something specific from their site. Imply risk (lost customers, competitors winning). Make it feel time-sensitive.
 WEBSITE DATA:
 {cleaned_html}"""
 
