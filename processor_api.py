@@ -11,8 +11,7 @@ import requests
 from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 from dataclasses import dataclass
-import hashlib
-import subprocess
+import unicodedata
 
 # ============================================================================
 # 🔥 CONFIGURATION
@@ -263,6 +262,84 @@ def extract_contact_info(text):
     return contact
 
 # ============================================================================
+# 🔤 ICE BREAKER EXTRACTION (GPT-5 ENHANCED)
+# ============================================================================
+ICE_BREAKER_HEADER_RE = re.compile(
+    r'^\s*(?:\d+\s*[\).:-]\s*)?(?:ice[\s\-]*breaker|icebreaker)\b.*$',
+    flags=re.IGNORECASE | re.MULTILINE
+)
+
+def extract_ice_breaker(full_text: str) -> str:
+    """Extract ice breaker from AI response"""
+    match = ICE_BREAKER_HEADER_RE.search(full_text)
+    if match:
+        after = full_text[match.end():]
+        for line in after.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            cleaned = re.sub(r'^[\-\*\u2022]\s*', '', cleaned).strip()
+            if cleaned and len(cleaned) > 12:
+                if not cleaned.endswith(('.', '!', '?')):
+                    cleaned += '.'
+                return cleaned[:350]
+    
+    # Fallback: Look for sentences with urgency keywords
+    for line in full_text.splitlines():
+        candidate = line.strip()
+        if (12 <= len(candidate) <= 350 and 
+            candidate[0].isupper() and 
+            candidate.endswith(('.', '!', '?')) and
+            any(word in candidate.lower() for word in 
+                ['noticed', 'spotted', 'see', 'found', 'missing', 'losing', 'costing'])):
+            return candidate
+    
+    return ""
+
+def generate_site_ice_breaker(restaurant_name: str, cleaned_html: str, preview_url: str) -> str:
+    """Generate fallback ice breaker for websites (ULTRA-SOLID)"""
+    title_match = re.search(r'^TITLE:\s*(.+)$', cleaned_html, flags=re.MULTILINE)
+    title = title_match.group(1).strip() if title_match else restaurant_name
+    
+    if len(title) > 50:
+        title = restaurant_name
+    
+    # Check for missing contact info
+    has_email = '@' in cleaned_html or 'email' in cleaned_html.lower()
+    has_phone = bool(re.search(r'\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', cleaned_html))
+    
+    if not has_email and not has_phone:
+        specific_issue = "your site is missing contact info"
+    elif not has_email:
+        specific_issue = "potential customers can't find your email"
+    elif not has_phone:
+        specific_issue = "your phone number isn't visible"
+    else:
+        specific_issue = "your site needs mobile optimization"
+    
+    return (
+        f"Quick note after reviewing {title}—I noticed {specific_issue}. "
+        f"This is likely costing you customers. Preview: {preview_url} "
+        f"Can we discuss a 24-hour fix?"
+    )
+
+def generate_fallback_ice_breaker(restaurant_name: str, preview_url: str) -> str:
+    """Generate fallback for NO website (ULTRA-SOLID)"""
+    return (
+        f"Hi, I noticed {restaurant_name} doesn't have a website—that's costing you 60%+ of potential customers "
+        f"who search online. I've created a preview of what your site could look like: {preview_url} "
+        f"Can I show you how to launch in 24 hours?"
+    )
+
+# ============================================================================
+# 🔗 ASCII SLUGGING (GPT-5 SUGGESTION)
+# ============================================================================
+def slug_ascii(text: str) -> str:
+    """Convert to ASCII-safe slug"""
+    normalized = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'[^a-z0-9]+', '-', normalized.lower()).strip('-')
+
+# ============================================================================
 # 🛡️ SAFE SHEET OPERATIONS
 # ============================================================================
 def safe_sheet_read(operation, operation_name, cache_key=None, max_retries=MAX_RETRIES):
@@ -315,31 +392,6 @@ def safe_sheet_write(operation, operation_name, max_retries=MAX_RETRIES):
             time.sleep(BASE_BACKOFF)
     
     raise Exception(f"Failed {operation_name} after {max_retries} attempts")
-
-# ============================================================================
-# 📅 DAILY TRACKING
-# ============================================================================
-def load_daily_log():
-    if os.path.exists(TRACKING_FILE):
-        try:
-            with open(TRACKING_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {"date": "", "processed_count": 0, "last_processed": ""}
-    return {"date": "", "processed_count": 0, "last_processed": ""}
-
-def save_daily_log(data):
-    with open(TRACKING_FILE, 'w') as f:
-        json.dump(data, f)
-
-def reset_daily_count_if_new_day(log_data):
-    today = datetime.now().strftime("%Y-%m-%d")
-    if log_data["date"] != today:
-        log_data["date"] = today
-        log_data["processed_count"] = 0
-        log_data["last_processed"] = ""
-        save_daily_log(log_data)
-    return log_data
 
 # ============================================================================
 # 🔤 TEXT NORMALIZATION
@@ -401,13 +453,11 @@ class DuplicateGuardian:
         if not dup_key:
             return False, "no_key"
         
-        # Check registry
         if dup_key in self.registry["keys"]:
             LOGGER.log("DuplicateGuardian", "phase1_registry_hit", TaskStatus.BLOCKED,
                        f"Found in registry: {dup_key}")
             return True, "registry"
         
-        # Check sheet
         try:
             results_data = safe_sheet_read(
                 lambda: results_worksheet.get_all_records(),
@@ -451,7 +501,11 @@ class DuplicateGuardian:
             return False, "no_key"
         
         try:
-            results_data = results_worksheet.get_all_records()
+            results_data = safe_sheet_read(
+                lambda: results_worksheet.get_all_records(),
+                "Phase2 sheet check",
+                None
+            )
             
             for row in results_data:
                 existing_name = str(row.get("Restaurant Name", "")).strip()
@@ -482,7 +536,11 @@ class DuplicateGuardian:
             return True, "no_key"
         
         try:
-            results_data = results_worksheet.get_all_records()
+            results_data = safe_sheet_read(
+                lambda: results_worksheet.get_all_records(),
+                "Phase3 sheet check",
+                None
+            )
             
             matches = []
             for idx, row in enumerate(results_data):
@@ -513,7 +571,6 @@ class DuplicateGuardian:
                 LOGGER.log("DuplicateGuardian", "phase3_duplicates_found", TaskStatus.CATASTROPHIC,
                            f"Found {len(matches)} duplicates!")
                 
-                # Delete duplicates
                 for row_num, _, _ in matches[1:]:
                     try:
                         results_worksheet.delete_rows(row_num)
@@ -594,7 +651,11 @@ class PhoneSyncGuardian:
         time.sleep(2)
         
         try:
-            results_data = results_worksheet.get_all_records()
+            results_data = safe_sheet_read(
+                lambda: results_worksheet.get_all_records(),
+                "Phase3 phone verify",
+                None
+            )
             
             for idx, row in enumerate(results_data):
                 row_name = str(row.get("Restaurant Name", "")).strip()
@@ -607,7 +668,6 @@ class PhoneSyncGuardian:
                                    f"Phone verified: {saved_phone}")
                         return True
                     else:
-                        # Fix it
                         row_num = idx + 2
                         try:
                             results_worksheet.update_cell(row_num, 6, expected_phone)
@@ -627,7 +687,7 @@ class PhoneSyncGuardian:
             return False
 
 # ============================================================================
-# 🔗 PREVIEW URL GUARDIAN
+# 🔗 PREVIEW URL GUARDIAN (GPT-5 ENHANCED)
 # ============================================================================
 class PreviewURLGuardian:
     """Ensures preview URL is always generated and embedded"""
@@ -635,8 +695,8 @@ class PreviewURLGuardian:
     BASE_URL = "https://lead-gen-engine.vercel.app"
     
     def phase1_generate(self, name: str) -> str:
-        """Phase 1: Generate URL"""
-        project_id = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+        """Phase 1: Generate URL with ASCII-safe slug"""
+        project_id = slug_ascii(name)
         url = f"{self.BASE_URL}/?client={project_id}"
         
         LOGGER.log("PreviewURLGuardian", "phase1_generated", TaskStatus.SUCCESS,
@@ -645,15 +705,25 @@ class PreviewURLGuardian:
         return url
     
     def phase2_embed_in_icebreaker(self, ice_breaker: str, preview_url: str) -> str:
-        """Phase 2: Embed URL"""
+        """Phase 2: Embed URL (GPT-5 HARDENED)"""
         
-        if preview_url in ice_breaker:
-            return ice_breaker
+        base = ice_breaker.strip()
         
-        if not ice_breaker.endswith(('.', '!', '?')):
-            ice_breaker += '.'
+        # Handle empty ice breaker
+        if not base:
+            base = "Quick note after reviewing your site—I can share a 24-hour plan to boost conversions."
+            LOGGER.log("PreviewURLGuardian", "phase2_empty_handled", TaskStatus.FALLBACK_USED,
+                       "Generated fallback for empty ice breaker")
         
-        enhanced = f"{ice_breaker} Preview: {preview_url}"
+        # Already has URL
+        if preview_url in base:
+            return base
+        
+        # Add punctuation if needed
+        if not base.endswith(('.', '!', '?')):
+            base += '.'
+        
+        enhanced = f"{base} Preview: {preview_url}"
         
         LOGGER.log("PreviewURLGuardian", "phase2_embedded", TaskStatus.FALLBACK_USED,
                    "Embedded preview URL")
@@ -668,7 +738,11 @@ class PreviewURLGuardian:
         time.sleep(2)
         
         try:
-            results_data = results_worksheet.get_all_records()
+            results_data = safe_sheet_read(
+                lambda: results_worksheet.get_all_records(),
+                "Phase3 URL verify",
+                None
+            )
             
             for idx, row in enumerate(results_data):
                 row_name = str(row.get("Restaurant Name", "")).strip()
@@ -685,7 +759,6 @@ class PreviewURLGuardian:
                                    "URL verified in both locations")
                         return True
                     else:
-                        # Fix it
                         row_num = idx + 2
                         try:
                             if not url_in_column:
@@ -750,7 +823,11 @@ class DataIntegrityGuardian:
         time.sleep(2)
         
         try:
-            results_data = results_worksheet.get_all_records()
+            results_data = safe_sheet_read(
+                lambda: results_worksheet.get_all_records(),
+                "Column integrity verify",
+                None
+            )
             
             for idx, row in enumerate(results_data):
                 if re.sub(r'[^a-z0-9]', '', str(row.get("Restaurant Name", "")).lower()) == \
@@ -781,7 +858,7 @@ class DataIntegrityGuardian:
             return False
 
 # ============================================================================
-# 🏥 SYSTEM HEALTH GUARDIAN - NEW!
+# 🏥 SYSTEM HEALTH GUARDIAN
 # ============================================================================
 class SystemHealthGuardian:
     """Monitors overall system health"""
@@ -800,7 +877,6 @@ class SystemHealthGuardian:
         LOGGER.log("SystemHealthGuardian", "health_check_start", TaskStatus.SUCCESS,
                    "Running system health check")
         
-        # Check Ollama
         try:
             ask_ollama("OK", max_tokens=5)
             self.health_data["ollama_status"] = True
@@ -809,19 +885,17 @@ class SystemHealthGuardian:
             LOGGER.log("SystemHealthGuardian", "ollama_down", TaskStatus.CATASTROPHIC,
                        "Ollama is not responding!")
         
-        # Check disk space
         try:
             import shutil
             total, used, free = shutil.disk_usage("/")
             self.health_data["disk_space_mb"] = free // (1024 * 1024)
             
-            if free < 1000 * 1024 * 1024:  # Less than 1GB
+            if free < 1000 * 1024 * 1024:
                 LOGGER.log("SystemHealthGuardian", "low_disk", TaskStatus.FAILED,
                            f"Low disk space: {free // (1024 * 1024)}MB")
         except:
             pass
         
-        # Check memory
         try:
             import psutil
             self.health_data["memory_usage_pct"] = psutil.virtual_memory().percent
@@ -834,28 +908,26 @@ class SystemHealthGuardian:
         
         self.health_data["last_check"] = datetime.now().isoformat()
         
-        # Save health data
         with open(HEALTH_CHECK_FILE, 'w') as f:
             json.dump(self.health_data, f, indent=2)
         
         return self.health_data
 
 # ============================================================================
-# 📊 RATE LIMIT GUARDIAN - NEW!
+# 📊 RATE LIMIT GUARDIAN (GPT-5: LOWERED TO 30)
 # ============================================================================
 class RateLimitGuardian:
     """Prevents rate limit violations"""
     
     def __init__(self):
         self.request_log = []
-        self.max_requests_per_minute = 60
+        self.max_requests_per_minute = 30  # GPT-5 suggestion
     
     def can_make_request(self) -> bool:
         """Check if request is allowed"""
         now = datetime.now()
         one_minute_ago = now - timedelta(minutes=1)
         
-        # Remove old requests
         self.request_log = [t for t in self.request_log if t > one_minute_ago]
         
         if len(self.request_log) >= self.max_requests_per_minute:
@@ -873,7 +945,7 @@ class RateLimitGuardian:
         self.request_log.append(datetime.now())
 
 # ============================================================================
-# 🔄 BACKUP GUARDIAN - NEW!
+# 🔄 BACKUP GUARDIAN
 # ============================================================================
 class BackupGuardian:
     """Ensures data is never lost"""
@@ -887,7 +959,7 @@ class BackupGuardian:
         try:
             backup_file = os.path.join(
                 self.backup_dir,
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{lead_data.restaurant_name.replace(' ', '_')}.json"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{slug_ascii(lead_data.restaurant_name)}.json"
             )
             
             with open(backup_file, 'w') as f:
@@ -1007,7 +1079,7 @@ class RestManager:
         self.leads_since_rest += 1
 
 # ============================================================================
-# 🎯 MASTER ORCHESTRATOR
+# 🎯 MASTER ORCHESTRATOR (WITH FULL ANALYSIS FLOW)
 # ============================================================================
 class MasterOrchestrator:
     """Coordinates all guardians"""
@@ -1026,12 +1098,11 @@ class MasterOrchestrator:
         self.leads_worksheet = leads_worksheet
         self.results_worksheet = results_worksheet
         
-        # Initialize
         self.phone_guardian.phase1_build_map(leads_worksheet)
         self.health_guardian.check_health()
     
     def process_lead_fully_supervised(self, lead: Dict, lead_row_index: int) -> bool:
-        """Process a lead with COMPLETE supervision"""
+        """Process a lead with COMPLETE supervision + FULL ANALYSIS"""
         
         restaurant_name = str(lead.get("Restaurant Name", "")).strip()
         phone_raw = str(lead.get("Phone Number", "")).strip()
@@ -1072,16 +1143,110 @@ class MasterOrchestrator:
         except:
             pass
         
-        # Process data
+        # ═══════════════════════════════════════════════════════════════
+        # FULL ANALYSIS FLOW (GPT-5 VERSION)
+        # ═══════════════════════════════════════════════════════════════
+        
         if not target_url or target_url.lower() in ["no website found", "", "n/a"]:
-            flaw_analysis = "No website found. Cannot perform analysis."
-            builder_prompt = "Create a modern, mobile-friendly website."
-            ice_breaker = f"Hi, I noticed {restaurant_name} doesn't have a website—that's costing you 60%+ of customers. Preview: {preview_url} Can I show you how to launch in 24 hours?"
+            # NO WEBSITE PATH
+            LOGGER.log("MasterOrchestrator", "no_website", TaskStatus.SUCCESS,
+                       "Taking no-website path")
+            
+            flaw_analysis = f"No website found for {restaurant_name}. This business needs a complete web presence to capture online customers."
+            builder_prompt = "Create modern site: mobile-first, contact info, menu/services, SEO"
+            ice_breaker = generate_fallback_ice_breaker(restaurant_name, preview_url)
+            
         else:
-            # Simplified - add your scraping/AI here
-            flaw_analysis = f"Website analysis for {restaurant_name}"
-            ice_breaker = f"Quick note about {restaurant_name}. Preview: {preview_url}"
-            builder_prompt = "Template-based fixes"
+            # WEBSITE EXISTS — FULL ANALYSIS
+            LOGGER.log("MasterOrchestrator", "scraping_start", TaskStatus.SUCCESS,
+                       f"Scraping {target_url}")
+            
+            try:
+                # Scrape with Playwright
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    try:
+                        page.goto(target_url, timeout=60000)
+                        body_html = page.locator("body").inner_html()
+                        LOGGER.log("MasterOrchestrator", "scraping_success", TaskStatus.SUCCESS,
+                                   f"Scraped {len(body_html)} chars")
+                    finally:
+                        browser.close()
+                
+                cleaned_html = clean_html_aggressive(body_html)
+                
+            except Exception as e:
+                LOGGER.log("MasterOrchestrator", "scraping_failed", TaskStatus.FAILED,
+                           f"Scraping failed: {e}")
+                cleaned_html = ""
+            
+            # AI Analysis
+            try:
+                if cleaned_html:
+                    prompt = f"""Analyze the website for "{restaurant_name}" and provide:
+
+1. KEY INFORMATION (3-4 bullet points):
+   - What the business does
+   - Contact info found/missing
+   - Main issues
+
+2. FIX CHECKLIST (5-7 actionable items):
+   - Missing contact details, broken UX, SEO issues
+
+3. ICE BREAKER (1-2 sentences, URGENT TONE):
+   - Write as if you already know them.
+   - Imply urgent risk (losing customers, competitors winning).
+   - Reference something SPECIFIC from their site.
+   - Make it personal and time-sensitive.
+
+WEBSITE DATA:
+{cleaned_html}
+"""
+                    
+                    LOGGER.log("MasterOrchestrator", "ollama_start", TaskStatus.SUCCESS,
+                               "Calling Ollama for analysis")
+                    
+                    full_response = ask_ollama(prompt, max_tokens=900, temperature=0.3)
+                    
+                    # Extract flaw analysis (everything before ice breaker)
+                    flaw_analysis = full_response.strip()
+                    
+                    # Extract ice breaker
+                    ice_breaker_extracted = extract_ice_breaker(full_response)
+                    
+                    if ice_breaker_extracted:
+                        ice_breaker = ice_breaker_extracted
+                        LOGGER.log("MasterOrchestrator", "ice_breaker_extracted", TaskStatus.SUCCESS,
+                                   "Extracted ice breaker from AI")
+                        
+                        # Remove ice breaker from flaw analysis
+                        if ICE_BREAKER_HEADER_RE.search(flaw_analysis):
+                            match = ICE_BREAKER_HEADER_RE.search(flaw_analysis)
+                            flaw_analysis = flaw_analysis[:match.start()].strip()
+                    else:
+                        ice_breaker = generate_site_ice_breaker(restaurant_name, cleaned_html, preview_url)
+                        LOGGER.log("MasterOrchestrator", "ice_breaker_fallback", TaskStatus.FALLBACK_USED,
+                                   "Using fallback ice breaker")
+                    
+                    builder_prompt = "Fix critical issues: contact info, mobile UX, SEO, speed"
+                    
+                else:
+                    # Scrape failed but website exists
+                    LOGGER.log("MasterOrchestrator", "no_html", TaskStatus.FAILED,
+                               "No HTML retrieved - using soft fallback")
+                    
+                    flaw_analysis = f"Could not retrieve site content for {restaurant_name}. Site may have technical issues preventing access."
+                    ice_breaker = generate_site_ice_breaker(restaurant_name, f"TITLE: {restaurant_name}", preview_url)
+                    builder_prompt = "Fix site accessibility, add backup contact methods"
+                    
+            except Exception as e:
+                LOGGER.log("MasterOrchestrator", "ollama_failed", TaskStatus.FAILED,
+                           f"Ollama analysis failed: {e}")
+                
+                flaw_analysis = f"Analysis unavailable for {restaurant_name} due to temporary AI error. Manual review recommended."
+                ice_breaker = generate_site_ice_breaker(restaurant_name, f"TITLE: {restaurant_name}", preview_url)
+                builder_prompt = "Manual review needed - apply standard best practices"
         
         # Ensure preview URL in ice breaker
         ice_breaker = self.preview_guardian.phase2_embed_in_icebreaker(ice_breaker, preview_url)
@@ -1185,11 +1350,13 @@ def main():
     print(f"   3. Preview URL Guardian (3-phase)")
     print(f"   4. Data Integrity Guardian")
     print(f"   5. System Health Guardian")
-    print(f"   6. Rate Limit Guardian")
+    print(f"   6. Rate Limit Guardian (30/min)")
     print(f"   7. Backup Guardian")
     print(f"   8. Progress Tracker")
     print(f"   9. Rest Manager")
     print(f"📊 Daily Goal: {MAX_LEADS_PER_DAY} leads")
+    print(f"🔥 FULL ANALYSIS: Playwright + Ollama")
+    print(f"💬 SOLID ICE BREAKERS: Personalized + Urgent")
     print(f"💰 Cost: ₹0 FOREVER!")
     print("="*70 + "\n")
     
@@ -1197,12 +1364,10 @@ def main():
     
     while True:
         try:
-            # Rest check
             if orchestrator.rest_manager.should_rest():
                 orchestrator.rest_manager.take_rest()
                 orchestrator.health_guardian.check_health()
             
-            # Fetch leads
             all_leads = safe_sheet_read(
                 lambda: leads_worksheet.get_all_records(),
                 "Fetch leads",
