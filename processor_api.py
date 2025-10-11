@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 from dataclasses import dataclass
 import hashlib
+import subprocess
 
 # ============================================================================
 # 🔥 CONFIGURATION
@@ -24,8 +25,8 @@ MAX_LEADS_PER_DAY = 50
 MIN_DELAY_SECONDS = 15
 MAX_DELAY_SECONDS = 45
 RETRY_DELAY_SECONDS = 60
-REST_AFTER_LEADS = 10  # Take rest after every 10 leads
-REST_DURATION = 300  # 5 minutes rest
+REST_AFTER_LEADS = 10
+REST_DURATION = 300
 
 # Files
 TRACKING_FILE = "daily_processing_log.json"
@@ -34,12 +35,14 @@ SUPERVISOR_LOG_FILE = "supervisor_decisions.jsonl"
 DUPLICATE_REGISTRY_FILE = "duplicate_registry.json"
 PHONE_SYNC_LOG_FILE = "phone_sync_log.json"
 PROGRESS_FILE = "progress_tracker.json"
+HEALTH_CHECK_FILE = "system_health.json"
 
 # Limits
 CACHE_DURATION = 300
 MAX_RETRIES = 5
 BASE_BACKOFF = 10
 MAX_HTML_LENGTH = 8000
+MIN_HTML_LENGTH = 500
 
 # ============================================================================
 # 📊 CORE TYPES
@@ -67,23 +70,15 @@ class LeadData:
     def to_sheet_row(self) -> List[str]:
         """Convert to sheet row format (17 columns)"""
         return [
-            self.restaurant_name,     # 1
-            self.flaw_analysis,       # 2
-            self.builder_prompt,      # 3
-            "",                       # 4. Outreach Status
-            self.preview_url,         # 5. Preview URL
-            self.phone,               # 6. Phone Number
-            "",                       # 7. Message ID
-            "",                       # 8. Last_Message_Sent
-            "",                       # 9. Last_Message_Content
-            "",                       # 10. Last_Reply_Received
-            "",                       # 11. Last_Reply_Content
-            "",                       # 12. Follow_Up_Count
-            "",                       # 13. Auto_Acknowledge_Sent
-            "",                       # 14. VAPI_Call_Scheduled
-            "",                       # 15. Call_Scheduled_At
-            self.ice_breaker,         # 16. Ice_Breaker
-            ""                        # 17. Source_Row
+            self.restaurant_name,
+            self.flaw_analysis,
+            self.builder_prompt,
+            "",
+            self.preview_url,
+            self.phone,
+            "", "", "", "", "", "", "", "", "",
+            self.ice_breaker,
+            ""
         ]
 
 # ============================================================================
@@ -108,7 +103,6 @@ class SupervisorLogger:
             "data": data or {}
         }
         
-        # Console output
         icons = {
             TaskStatus.SUCCESS: "✅",
             TaskStatus.FAILED: "❌",
@@ -120,7 +114,6 @@ class SupervisorLogger:
         icon = icons.get(status, "ℹ️")
         print(f"{icon} [{supervisor}:{phase}] {details}")
         
-        # File output
         try:
             with open(SUPERVISOR_LOG_FILE, 'a') as f:
                 f.write(json.dumps(log_entry) + '\n')
@@ -130,21 +123,249 @@ class SupervisorLogger:
 LOGGER = SupervisorLogger()
 
 # ============================================================================
+# 🤖 OLLAMA FUNCTIONS
+# ============================================================================
+def ask_ollama(prompt, max_tokens=800, temperature=0.3):
+    """Call Ollama API"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": max_tokens,
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                }
+            },
+            timeout=120
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return result['response']
+        else:
+            raise Exception(f"Ollama HTTP {response.status_code}")
+    except requests.exceptions.Timeout:
+        raise Exception("Ollama timeout")
+    except requests.exceptions.ConnectionError:
+        raise Exception("Cannot connect to Ollama")
+    except Exception as e:
+        raise Exception(f"Ollama error: {str(e)}")
+
+def verify_ollama():
+    """Verify Ollama is running"""
+    try:
+        print("\n🔍 Verifying Ollama setup...")
+        test_response = ask_ollama("Say OK", max_tokens=10)
+        print("✅ Ollama is running")
+        print(f"✅ Model: {OLLAMA_MODEL}")
+        print("💰 Cost: ₹0 (FREE FOREVER!)")
+        return True
+    except Exception as e:
+        print(f"❌ Ollama verification failed: {e}")
+        print("\n📋 SETUP INSTRUCTIONS:")
+        print("1. Install: curl -fsSL https://ollama.com/install.sh | sh")
+        print("2. Start: ollama serve &")
+        print(f"3. Pull model: ollama pull {OLLAMA_MODEL}")
+        exit(1)
+
+# ============================================================================
+# 🗄️ CACHING LAYER
+# ============================================================================
+class SheetsCache:
+    def __init__(self):
+        self.cache = self.load_cache()
+    
+    def load_cache(self):
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save_cache(self):
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(self.cache, f)
+    
+    def get(self, key):
+        if key in self.cache:
+            cached_data = self.cache[key]
+            if time.time() - cached_data['timestamp'] < CACHE_DURATION:
+                return cached_data['data']
+        return None
+    
+    def set(self, key, data):
+        self.cache[key] = {'data': data, 'timestamp': time.time()}
+        self.save_cache()
+
+cache = SheetsCache()
+
+# ============================================================================
+# 🧹 HTML CLEANING
+# ============================================================================
+def clean_html_aggressive(html_content):
+    """Clean HTML aggressively"""
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        for tag in soup(['script', 'style', 'noscript', 'iframe', 'svg', 'path', 
+                         'meta', 'link', 'head', 'footer', 'nav', 'aside']):
+            tag.decompose()
+        
+        text = soup.get_text(separator=' ', strip=True)
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(\S)\1{3,}', r'\1\1', text)
+        text = re.sub(r'[^\w\s@.,!?;:()\-\'\"\/]', '', text)
+        
+        structured_data = {
+            'title': soup.title.string if soup.title else '',
+            'headings': [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2', 'h3'])[:8]],
+            'meta_desc': '',
+            'contact_info': extract_contact_info(text),
+        }
+        
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            structured_data['meta_desc'] = meta_desc['content'][:150]
+        
+        if len(text) > MAX_HTML_LENGTH:
+            mid_point = MAX_HTML_LENGTH // 2
+            text = text[:mid_point] + " [...] " + text[-mid_point:]
+        
+        compact_html = f"""
+TITLE: {structured_data['title']}
+DESC: {structured_data['meta_desc']}
+HEADINGS: {', '.join(structured_data['headings'])}
+CONTACT: {json.dumps(structured_data['contact_info'])}
+TEXT:
+{text}
+"""
+        return compact_html.strip()
+    except Exception as e:
+        LOGGER.log("HTMLCleaner", "error", TaskStatus.FAILED, f"Cleaning failed: {e}")
+        return html_content[:MAX_HTML_LENGTH]
+
+def extract_contact_info(text):
+    """Extract contact info from text"""
+    contact = {}
+    emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+    if emails:
+        contact['emails'] = list(set(emails))[:3]
+    phones = re.findall(r'[\+\(]?[0-9][0-9\s\-\(\)]{8,}[0-9]', text)
+    if phones:
+        contact['phones'] = list(set([p.strip() for p in phones]))[:3]
+    if 'instagram' in text.lower() or '@' in text:
+        contact['has_social'] = True
+    return contact
+
+# ============================================================================
+# 🛡️ SAFE SHEET OPERATIONS
+# ============================================================================
+def safe_sheet_read(operation, operation_name, cache_key=None, max_retries=MAX_RETRIES):
+    """Safe read with caching"""
+    if cache_key:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+    
+    for attempt in range(max_retries):
+        try:
+            result = operation()
+            if cache_key:
+                cache.set(cache_key, result)
+            time.sleep(2)
+            return result
+        except gspread.exceptions.APIError as e:
+            if '429' in str(e):
+                wait_time = (2 ** attempt) * BASE_BACKOFF
+                LOGGER.log("SheetReader", "rate_limit", TaskStatus.RETRY_NEEDED,
+                          f"Rate limit hit. Waiting {wait_time}s")
+                time.sleep(wait_time)
+            else:
+                time.sleep(BASE_BACKOFF)
+        except Exception as e:
+            LOGGER.log("SheetReader", "error", TaskStatus.FAILED, f"{operation_name}: {e}")
+            time.sleep(BASE_BACKOFF)
+    
+    raise Exception(f"Failed {operation_name} after {max_retries} attempts")
+
+def safe_sheet_write(operation, operation_name, max_retries=MAX_RETRIES):
+    """Safe write with retries"""
+    for attempt in range(max_retries):
+        try:
+            result = operation()
+            time.sleep(SHEET_UPDATE_DELAY)
+            cache.cache = {}
+            cache.save_cache()
+            return result
+        except gspread.exceptions.APIError as e:
+            if '429' in str(e):
+                wait_time = (2 ** attempt) * BASE_BACKOFF
+                LOGGER.log("SheetWriter", "rate_limit", TaskStatus.RETRY_NEEDED,
+                          f"Rate limit hit. Waiting {wait_time}s")
+                time.sleep(wait_time)
+            else:
+                time.sleep(BASE_BACKOFF)
+        except Exception as e:
+            LOGGER.log("SheetWriter", "error", TaskStatus.FAILED, f"{operation_name}: {e}")
+            time.sleep(BASE_BACKOFF)
+    
+    raise Exception(f"Failed {operation_name} after {max_retries} attempts")
+
+# ============================================================================
+# 📅 DAILY TRACKING
+# ============================================================================
+def load_daily_log():
+    if os.path.exists(TRACKING_FILE):
+        try:
+            with open(TRACKING_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {"date": "", "processed_count": 0, "last_processed": ""}
+    return {"date": "", "processed_count": 0, "last_processed": ""}
+
+def save_daily_log(data):
+    with open(TRACKING_FILE, 'w') as f:
+        json.dump(data, f)
+
+def reset_daily_count_if_new_day(log_data):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if log_data["date"] != today:
+        log_data["date"] = today
+        log_data["processed_count"] = 0
+        log_data["last_processed"] = ""
+        save_daily_log(log_data)
+    return log_data
+
+# ============================================================================
+# 🔤 TEXT NORMALIZATION
+# ============================================================================
+def normalize_text(text):
+    if not text:
+        return ""
+    cleaned = re.sub(r'[^a-z0-9\s]', '', str(text).lower())
+    return ' '.join(cleaned.split())
+
+def normalize_phone(phone):
+    if not phone:
+        return ""
+    digits = ''.join(filter(str.isdigit, str(phone)))
+    return digits[-10:] if len(digits) >= 10 else digits
+
+# ============================================================================
 # 🛡️ DUPLICATE GUARDIAN - 3-PHASE PROTECTION
 # ============================================================================
 class DuplicateGuardian:
-    """
-    Triple-layer duplicate prevention:
-    - Phase 1: Before processing (registry check)
-    - Phase 2: During processing (live check)
-    - Phase 3: After processing (verification)
-    """
+    """Triple-layer duplicate prevention"""
     
     def __init__(self):
         self.registry = self._load_registry()
     
     def _load_registry(self) -> Dict:
-        """Load persistent duplicate registry"""
         if os.path.exists(DUPLICATE_REGISTRY_FILE):
             try:
                 with open(DUPLICATE_REGISTRY_FILE, 'r') as f:
@@ -154,17 +375,14 @@ class DuplicateGuardian:
         return {"keys": {}, "last_updated": None}
     
     def _save_registry(self):
-        """Save registry to disk"""
         self.registry["last_updated"] = datetime.now().isoformat()
         with open(DUPLICATE_REGISTRY_FILE, 'w') as f:
             json.dump(self.registry, f, indent=2)
     
     def _create_duplicate_key(self, name: str, phone: str) -> str:
-        """Create unique key for duplicate detection"""
         name_norm = re.sub(r'[^a-z0-9]', '', name.lower())
         phone_norm = ''.join(filter(str.isdigit, phone))[-10:] if phone else ""
         
-        # Use phone if available, else name
         if phone_norm and len(phone_norm) == 10:
             key = f"phone:{phone_norm}"
         elif name_norm:
@@ -174,40 +392,27 @@ class DuplicateGuardian:
         
         return key
     
-    def _generate_fingerprint(self, name: str, phone: str) -> str:
-        """Generate unique fingerprint"""
-        content = f"{name.lower().strip()}:{phone.strip()}"
-        return hashlib.md5(content.encode()).hexdigest()
-    
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 1: BEFORE PROCESSING
-    # ═══════════════════════════════════════════════════════════════
     def phase1_check_before(self, name: str, phone: str, results_worksheet) -> Tuple[bool, str]:
-        """
-        Phase 1: Check BEFORE processing starts
-        Returns: (is_duplicate, reason)
-        """
+        """Phase 1: Check BEFORE processing"""
         LOGGER.log("DuplicateGuardian", "phase1_start", TaskStatus.SUCCESS,
                    f"Phase 1 check for {name}")
         
         dup_key = self._create_duplicate_key(name, phone)
         if not dup_key:
-            LOGGER.log("DuplicateGuardian", "phase1_no_key", TaskStatus.SUCCESS,
-                       "No valid key - allowing")
             return False, "no_key"
         
-        # Check 1: Registry (fast local check)
+        # Check registry
         if dup_key in self.registry["keys"]:
             LOGGER.log("DuplicateGuardian", "phase1_registry_hit", TaskStatus.BLOCKED,
                        f"Found in registry: {dup_key}")
             return True, "registry"
         
-        # Check 2: Live sheet check
+        # Check sheet
         try:
             results_data = safe_sheet_read(
                 lambda: results_worksheet.get_all_records(),
                 "Phase1 sheet check",
-                None  # No cache for duplicate checks
+                None
             )
             
             for row in results_data:
@@ -218,7 +423,6 @@ class DuplicateGuardian:
                 if existing_key and dup_key == existing_key:
                     LOGGER.log("DuplicateGuardian", "phase1_sheet_hit", TaskStatus.BLOCKED,
                                f"Found in sheet: {existing_name}")
-                    # Add to registry
                     self.registry["keys"][dup_key] = {
                         "name": existing_name,
                         "phone": existing_phone,
@@ -235,25 +439,17 @@ class DuplicateGuardian:
                    f"Phase 1 passed for {name}")
         return False, "passed"
     
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 2: DURING PROCESSING
-    # ═══════════════════════════════════════════════════════════════
     def phase2_check_during(self, name: str, phone: str, results_worksheet) -> Tuple[bool, str]:
-        """
-        Phase 2: Check DURING processing (before save)
-        Returns: (is_duplicate, reason)
-        """
+        """Phase 2: Check DURING processing"""
         LOGGER.log("DuplicateGuardian", "phase2_start", TaskStatus.SUCCESS,
                    f"Phase 2 check for {name}")
         
-        # Wait a moment for any concurrent operations
         time.sleep(2)
         
         dup_key = self._create_duplicate_key(name, phone)
         if not dup_key:
             return False, "no_key"
         
-        # Fresh sheet check (no cache)
         try:
             results_data = results_worksheet.get_all_records()
             
@@ -264,11 +460,9 @@ class DuplicateGuardian:
                 
                 if existing_key and dup_key == existing_key:
                     LOGGER.log("DuplicateGuardian", "phase2_duplicate", TaskStatus.BLOCKED,
-                               f"Duplicate detected during processing: {existing_name}")
+                               f"Duplicate detected: {existing_name}")
                     return True, "concurrent"
             
-            LOGGER.log("DuplicateGuardian", "phase2_passed", TaskStatus.SUCCESS,
-                       f"Phase 2 passed for {name}")
             return False, "passed"
             
         except Exception as e:
@@ -276,18 +470,11 @@ class DuplicateGuardian:
                        f"Phase 2 check failed: {e}")
             return False, "error"
     
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 3: AFTER PROCESSING
-    # ═══════════════════════════════════════════════════════════════
     def phase3_verify_after(self, name: str, phone: str, results_worksheet) -> Tuple[bool, str]:
-        """
-        Phase 3: Verify AFTER save
-        Returns: (is_single, status)
-        """
+        """Phase 3: Verify AFTER save"""
         LOGGER.log("DuplicateGuardian", "phase3_start", TaskStatus.SUCCESS,
                    f"Phase 3 verification for {name}")
         
-        # Wait for write to settle
         time.sleep(3)
         
         dup_key = self._create_duplicate_key(name, phone)
@@ -308,13 +495,12 @@ class DuplicateGuardian:
             
             if len(matches) == 0:
                 LOGGER.log("DuplicateGuardian", "phase3_missing", TaskStatus.CATASTROPHIC,
-                           f"Entry not found after save!")
+                           "Entry not found after save!")
                 return False, "missing"
             
             elif len(matches) == 1:
                 LOGGER.log("DuplicateGuardian", "phase3_success", TaskStatus.SUCCESS,
                            f"Verified single entry for {name}")
-                # Add to registry
                 self.registry["keys"][dup_key] = {
                     "name": name,
                     "phone": phone,
@@ -325,9 +511,9 @@ class DuplicateGuardian:
             
             else:
                 LOGGER.log("DuplicateGuardian", "phase3_duplicates_found", TaskStatus.CATASTROPHIC,
-                           f"Found {len(matches)} duplicates for {name}!")
+                           f"Found {len(matches)} duplicates!")
                 
-                # Delete all but first
+                # Delete duplicates
                 for row_num, _, _ in matches[1:]:
                     try:
                         results_worksheet.delete_rows(row_num)
@@ -346,35 +532,21 @@ class DuplicateGuardian:
             return False, "error"
 
 # ============================================================================
-# 📞 PHONE SYNC GUARDIAN - 3-PHASE SYNC
+# 📞 PHONE SYNC GUARDIAN
 # ============================================================================
 class PhoneSyncGuardian:
-    """
-    Ensures phone numbers are always in sync:
-    - Phase 1: Before processing (validate source)
-    - Phase 2: During processing (embed correct phone)
-    - Phase 3: After processing (verify sync)
-    """
+    """Ensures phone numbers are always in sync"""
     
     def __init__(self):
         self.phone_map = {}
     
     def _normalize_name(self, name: str) -> str:
-        """Normalize name for matching"""
         return re.sub(r'[^a-z0-9]', '', name.lower())
     
-    def _normalize_phone(self, phone: str) -> str:
-        """Normalize phone"""
-        digits = ''.join(filter(str.isdigit, str(phone)))
-        return digits[-10:] if len(digits) >= 10 else digits
-    
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 1: BUILD PHONE MAP
-    # ═══════════════════════════════════════════════════════════════
     def phase1_build_map(self, leads_worksheet):
-        """Phase 1: Build authoritative phone map from LEADS"""
+        """Phase 1: Build phone map"""
         LOGGER.log("PhoneSyncGuardian", "phase1_start", TaskStatus.SUCCESS,
-                   "Building phone map from LEADS")
+                   "Building phone map")
         
         try:
             leads_data = safe_sheet_read(
@@ -399,11 +571,8 @@ class PhoneSyncGuardian:
             LOGGER.log("PhoneSyncGuardian", "phase1_error", TaskStatus.FAILED,
                        f"Failed to build map: {e}")
     
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 2: GET CORRECT PHONE
-    # ═══════════════════════════════════════════════════════════════
     def phase2_get_correct_phone(self, name: str, provided_phone: str) -> str:
-        """Phase 2: Get authoritative phone for this lead"""
+        """Phase 2: Get correct phone"""
         name_norm = self._normalize_name(name)
         
         if name_norm in self.phone_map:
@@ -411,22 +580,14 @@ class PhoneSyncGuardian:
             
             if correct_phone != provided_phone:
                 LOGGER.log("PhoneSyncGuardian", "phase2_correction", TaskStatus.FALLBACK_USED,
-                           f"Correcting phone for {name}: {provided_phone} → {correct_phone}")
-            else:
-                LOGGER.log("PhoneSyncGuardian", "phase2_match", TaskStatus.SUCCESS,
-                           f"Phone matches for {name}")
+                           f"Correcting phone: {provided_phone} → {correct_phone}")
             
             return correct_phone
         else:
-            LOGGER.log("PhoneSyncGuardian", "phase2_not_found", TaskStatus.FAILED,
-                       f"Name not found in map: {name}")
             return provided_phone if provided_phone else "No Number"
     
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 3: VERIFY AFTER SAVE
-    # ═══════════════════════════════════════════════════════════════
     def phase3_verify_sync(self, name: str, expected_phone: str, results_worksheet) -> bool:
-        """Phase 3: Verify phone is correctly saved"""
+        """Phase 3: Verify phone"""
         LOGGER.log("PhoneSyncGuardian", "phase3_start", TaskStatus.SUCCESS,
                    f"Verifying phone for {name}")
         
@@ -443,12 +604,9 @@ class PhoneSyncGuardian:
                     
                     if saved_phone == expected_phone:
                         LOGGER.log("PhoneSyncGuardian", "phase3_verified", TaskStatus.SUCCESS,
-                                   f"Phone verified for {name}: {saved_phone}")
+                                   f"Phone verified: {saved_phone}")
                         return True
                     else:
-                        LOGGER.log("PhoneSyncGuardian", "phase3_mismatch", TaskStatus.FAILED,
-                                   f"Phone mismatch for {name}: expected {expected_phone}, got {saved_phone}")
-                        
                         # Fix it
                         row_num = idx + 2
                         try:
@@ -458,11 +616,9 @@ class PhoneSyncGuardian:
                             return True
                         except Exception as e:
                             LOGGER.log("PhoneSyncGuardian", "phase3_fix_failed", TaskStatus.CATASTROPHIC,
-                                       f"Failed to fix phone: {e}")
+                                       f"Failed to fix: {e}")
                             return False
             
-            LOGGER.log("PhoneSyncGuardian", "phase3_not_found", TaskStatus.FAILED,
-                       f"Entry not found for {name}")
             return False
             
         except Exception as e:
@@ -471,64 +627,43 @@ class PhoneSyncGuardian:
             return False
 
 # ============================================================================
-# 🔗 PREVIEW URL GUARDIAN - 3-PHASE VALIDATION
+# 🔗 PREVIEW URL GUARDIAN
 # ============================================================================
 class PreviewURLGuardian:
-    """
-    Ensures preview URL is always generated and embedded:
-    - Phase 1: Before processing (generate URL)
-    - Phase 2: During processing (embed in ice breaker)
-    - Phase 3: After processing (verify presence)
-    """
+    """Ensures preview URL is always generated and embedded"""
     
     BASE_URL = "https://lead-gen-engine.vercel.app"
     
-    def _generate_url(self, name: str) -> str:
-        """Generate preview URL"""
-        project_id = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
-        return f"{self.BASE_URL}/?client={project_id}"
-    
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 1: GENERATE
-    # ═══════════════════════════════════════════════════════════════
     def phase1_generate(self, name: str) -> str:
-        """Phase 1: Generate preview URL"""
-        url = self._generate_url(name)
+        """Phase 1: Generate URL"""
+        project_id = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+        url = f"{self.BASE_URL}/?client={project_id}"
         
         LOGGER.log("PreviewURLGuardian", "phase1_generated", TaskStatus.SUCCESS,
-                   f"Generated URL for {name}: {url}")
+                   f"Generated URL: {url}")
         
         return url
     
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 2: EMBED IN ICE BREAKER
-    # ═══════════════════════════════════════════════════════════════
     def phase2_embed_in_icebreaker(self, ice_breaker: str, preview_url: str) -> str:
-        """Phase 2: Ensure URL is in ice breaker"""
+        """Phase 2: Embed URL"""
         
         if preview_url in ice_breaker:
-            LOGGER.log("PreviewURLGuardian", "phase2_already_present", TaskStatus.SUCCESS,
-                       "Preview URL already in ice breaker")
             return ice_breaker
         
-        # Add URL
         if not ice_breaker.endswith(('.', '!', '?')):
             ice_breaker += '.'
         
         enhanced = f"{ice_breaker} Preview: {preview_url}"
         
         LOGGER.log("PreviewURLGuardian", "phase2_embedded", TaskStatus.FALLBACK_USED,
-                   "Embedded preview URL into ice breaker")
+                   "Embedded preview URL")
         
         return enhanced
     
-    # ═══════════════════════════════════════════════════════════════
-    # PHASE 3: VERIFY IN SAVED DATA
-    # ═══════════════════════════════════════════════════════════════
     def phase3_verify_saved(self, name: str, expected_url: str, results_worksheet) -> bool:
-        """Phase 3: Verify URL is in both columns"""
+        """Phase 3: Verify URL saved"""
         LOGGER.log("PreviewURLGuardian", "phase3_start", TaskStatus.SUCCESS,
-                   f"Verifying preview URL for {name}")
+                   f"Verifying URL for {name}")
         
         time.sleep(2)
         
@@ -547,26 +682,21 @@ class PreviewURLGuardian:
                     
                     if url_in_column and url_in_icebreaker:
                         LOGGER.log("PreviewURLGuardian", "phase3_verified", TaskStatus.SUCCESS,
-                                   f"Preview URL verified in both locations for {name}")
+                                   "URL verified in both locations")
                         return True
                     else:
-                        LOGGER.log("PreviewURLGuardian", "phase3_missing", TaskStatus.FAILED,
-                                   f"Preview URL missing - Column: {url_in_column}, Icebreaker: {url_in_icebreaker}")
-                        
                         # Fix it
                         row_num = idx + 2
                         try:
                             if not url_in_column:
                                 results_worksheet.update_cell(row_num, 5, expected_url)
-                                LOGGER.log("PreviewURLGuardian", "phase3_fixed_column", TaskStatus.FALLBACK_USED,
-                                           "Fixed Preview URL column")
                             
                             if not url_in_icebreaker:
                                 fixed_ice = self.phase2_embed_in_icebreaker(ice_breaker, expected_url)
                                 results_worksheet.update_cell(row_num, 16, fixed_ice)
-                                LOGGER.log("PreviewURLGuardian", "phase3_fixed_icebreaker", TaskStatus.FALLBACK_USED,
-                                           "Fixed ice breaker")
                             
+                            LOGGER.log("PreviewURLGuardian", "phase3_fixed", TaskStatus.FALLBACK_USED,
+                                       "Fixed URL placement")
                             return True
                         except Exception as e:
                             LOGGER.log("PreviewURLGuardian", "phase3_fix_failed", TaskStatus.CATASTROPHIC,
@@ -581,26 +711,15 @@ class PreviewURLGuardian:
             return False
 
 # ============================================================================
-# 📋 DATA INTEGRITY GUARDIAN - Column Validation
+# 📋 DATA INTEGRITY GUARDIAN
 # ============================================================================
 class DataIntegrityGuardian:
     """Ensures all data is in correct columns"""
     
-    EXPECTED_COLUMNS = {
-        1: "Restaurant Name",
-        2: "Flaw Analysis", 
-        3: "Builder Prompt",
-        4: "Outreach Status",
-        5: "Preview URL",
-        6: "Phone Number",
-        16: "Ice_Breaker"
-    }
-    
     def validate_row_structure(self, lead_data: LeadData) -> Tuple[bool, List[str]]:
-        """Validate data structure before save"""
+        """Validate data structure"""
         issues = []
         
-        # Check all required fields
         if not lead_data.restaurant_name:
             issues.append("Missing restaurant name")
         
@@ -618,16 +737,16 @@ class DataIntegrityGuardian:
         
         if issues:
             LOGGER.log("DataIntegrityGuardian", "validation_failed", TaskStatus.FAILED,
-                       f"Validation issues: {', '.join(issues)}")
+                       f"Issues: {', '.join(issues)}")
             return False, issues
         
         LOGGER.log("DataIntegrityGuardian", "validation_passed", TaskStatus.SUCCESS,
-                   f"Data structure validated for {lead_data.restaurant_name}")
+                   "Data structure validated")
         return True, []
     
     def verify_saved_columns(self, name: str, expected_data: LeadData, 
                             results_worksheet) -> bool:
-        """Verify data saved to correct columns"""
+        """Verify columns"""
         time.sleep(2)
         
         try:
@@ -637,7 +756,6 @@ class DataIntegrityGuardian:
                 if re.sub(r'[^a-z0-9]', '', str(row.get("Restaurant Name", "")).lower()) == \
                    re.sub(r'[^a-z0-9]', '', name.lower()):
                     
-                    # Verify each column
                     checks = {
                         "Restaurant Name": row.get("Restaurant Name") == expected_data.restaurant_name,
                         "Preview URL": row.get("Preview URL") == expected_data.preview_url,
@@ -645,30 +763,158 @@ class DataIntegrityGuardian:
                         "Ice Breaker": expected_data.preview_url in str(row.get("Ice_Breaker", ""))
                     }
                     
-                    all_correct = all(checks.values())
-                    
-                    if all_correct:
+                    if all(checks.values()):
                         LOGGER.log("DataIntegrityGuardian", "columns_verified", TaskStatus.SUCCESS,
-                                   f"All columns correct for {name}")
+                                   "All columns correct")
                         return True
                     else:
                         failed = [k for k, v in checks.items() if not v]
                         LOGGER.log("DataIntegrityGuardian", "column_mismatch", TaskStatus.FAILED,
-                                   f"Column issues: {', '.join(failed)}")
+                                   f"Issues: {', '.join(failed)}")
                         return False
             
             return False
             
         except Exception as e:
             LOGGER.log("DataIntegrityGuardian", "verification_error", TaskStatus.FAILED,
-                       f"Column verification failed: {e}")
+                       f"Verification failed: {e}")
             return False
+
+# ============================================================================
+# 🏥 SYSTEM HEALTH GUARDIAN - NEW!
+# ============================================================================
+class SystemHealthGuardian:
+    """Monitors overall system health"""
+    
+    def __init__(self):
+        self.health_data = {
+            "last_check": None,
+            "ollama_status": False,
+            "sheets_status": False,
+            "disk_space_mb": 0,
+            "memory_usage_pct": 0
+        }
+    
+    def check_health(self) -> Dict[str, Any]:
+        """Comprehensive health check"""
+        LOGGER.log("SystemHealthGuardian", "health_check_start", TaskStatus.SUCCESS,
+                   "Running system health check")
+        
+        # Check Ollama
+        try:
+            ask_ollama("OK", max_tokens=5)
+            self.health_data["ollama_status"] = True
+        except:
+            self.health_data["ollama_status"] = False
+            LOGGER.log("SystemHealthGuardian", "ollama_down", TaskStatus.CATASTROPHIC,
+                       "Ollama is not responding!")
+        
+        # Check disk space
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage("/")
+            self.health_data["disk_space_mb"] = free // (1024 * 1024)
+            
+            if free < 1000 * 1024 * 1024:  # Less than 1GB
+                LOGGER.log("SystemHealthGuardian", "low_disk", TaskStatus.FAILED,
+                           f"Low disk space: {free // (1024 * 1024)}MB")
+        except:
+            pass
+        
+        # Check memory
+        try:
+            import psutil
+            self.health_data["memory_usage_pct"] = psutil.virtual_memory().percent
+            
+            if self.health_data["memory_usage_pct"] > 90:
+                LOGGER.log("SystemHealthGuardian", "high_memory", TaskStatus.FAILED,
+                           f"High memory usage: {self.health_data['memory_usage_pct']}%")
+        except:
+            pass
+        
+        self.health_data["last_check"] = datetime.now().isoformat()
+        
+        # Save health data
+        with open(HEALTH_CHECK_FILE, 'w') as f:
+            json.dump(self.health_data, f, indent=2)
+        
+        return self.health_data
+
+# ============================================================================
+# 📊 RATE LIMIT GUARDIAN - NEW!
+# ============================================================================
+class RateLimitGuardian:
+    """Prevents rate limit violations"""
+    
+    def __init__(self):
+        self.request_log = []
+        self.max_requests_per_minute = 60
+    
+    def can_make_request(self) -> bool:
+        """Check if request is allowed"""
+        now = datetime.now()
+        one_minute_ago = now - timedelta(minutes=1)
+        
+        # Remove old requests
+        self.request_log = [t for t in self.request_log if t > one_minute_ago]
+        
+        if len(self.request_log) >= self.max_requests_per_minute:
+            LOGGER.log("RateLimitGuardian", "limit_reached", TaskStatus.BLOCKED,
+                       "Rate limit reached - waiting")
+            return False
+        
+        return True
+    
+    def wait_if_needed(self):
+        """Wait until request can be made"""
+        while not self.can_make_request():
+            time.sleep(2)
+        
+        self.request_log.append(datetime.now())
+
+# ============================================================================
+# 🔄 BACKUP GUARDIAN - NEW!
+# ============================================================================
+class BackupGuardian:
+    """Ensures data is never lost"""
+    
+    def __init__(self):
+        self.backup_dir = "lead_backups"
+        os.makedirs(self.backup_dir, exist_ok=True)
+    
+    def backup_lead_data(self, lead_data: LeadData):
+        """Backup lead data locally"""
+        try:
+            backup_file = os.path.join(
+                self.backup_dir,
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{lead_data.restaurant_name.replace(' ', '_')}.json"
+            )
+            
+            with open(backup_file, 'w') as f:
+                json.dump({
+                    "timestamp": datetime.now().isoformat(),
+                    "data": {
+                        "restaurant_name": lead_data.restaurant_name,
+                        "phone": lead_data.phone,
+                        "website_url": lead_data.website_url,
+                        "flaw_analysis": lead_data.flaw_analysis,
+                        "preview_url": lead_data.preview_url,
+                        "ice_breaker": lead_data.ice_breaker
+                    }
+                }, f, indent=2)
+            
+            LOGGER.log("BackupGuardian", "backup_saved", TaskStatus.SUCCESS,
+                       f"Backed up: {backup_file}")
+            
+        except Exception as e:
+            LOGGER.log("BackupGuardian", "backup_failed", TaskStatus.FAILED,
+                       f"Backup failed: {e}")
 
 # ============================================================================
 # 📊 PROGRESS TRACKER
 # ============================================================================
 class ProgressTracker:
-    """Real-time progress tracking with goals"""
+    """Real-time progress tracking"""
     
     def __init__(self, daily_goal: int):
         self.daily_goal = daily_goal
@@ -677,7 +923,7 @@ class ProgressTracker:
         self.successful = 0
         self.failed = 0
         self.duplicates_blocked = 0
-        
+    
     def update(self, success: bool, duplicate: bool = False):
         """Update progress"""
         self.processed += 1
@@ -691,7 +937,7 @@ class ProgressTracker:
         self._display_progress()
     
     def _display_progress(self):
-        """Display beautiful progress"""
+        """Display progress"""
         elapsed = (datetime.now() - self.session_start).total_seconds()
         elapsed_min = elapsed / 60
         
@@ -705,7 +951,6 @@ class ProgressTracker:
         else:
             eta_min = 0
         
-        # Progress bar
         bar_length = 30
         filled = int(bar_length * progress_pct / 100)
         bar = '█' * filled + '░' * (bar_length - filled)
@@ -729,7 +974,7 @@ class ProgressTracker:
 # 😴 REST MANAGER
 # ============================================================================
 class RestManager:
-    """Manages rest periods for the system"""
+    """Manages rest periods"""
     
     def __init__(self, rest_after: int, rest_duration: int):
         self.rest_after = rest_after
@@ -737,60 +982,57 @@ class RestManager:
         self.leads_since_rest = 0
     
     def should_rest(self) -> bool:
-        """Check if system should rest"""
         return self.leads_since_rest >= self.rest_after
     
     def take_rest(self):
-        """Take a rest period"""
         LOGGER.log("RestManager", "rest_start", TaskStatus.SUCCESS,
-                   f"Taking {self.rest_duration}s rest after {self.leads_since_rest} leads")
+                   f"Taking {self.rest_duration}s rest")
         
         print(f"\n{'='*70}")
         print(f"😴 REST PERIOD")
         print(f"{'='*70}")
         print(f"✅ Completed {self.leads_since_rest} leads")
         print(f"⏰ Resting for {self.rest_duration / 60:.1f} minutes")
-        print(f"🔋 System health check...")
         print(f"{'='*70}\n")
         
         time.sleep(self.rest_duration)
         
         self.leads_since_rest = 0
         
-        LOGGER.log("RestManager", "rest_complete", TaskStatus.SUCCESS,
-                   "Rest period complete - resuming operations")
-        
         print(f"\n{'='*70}")
         print(f"🚀 RESUMING OPERATIONS")
         print(f"{'='*70}\n")
     
     def increment(self):
-        """Increment lead counter"""
         self.leads_since_rest += 1
 
 # ============================================================================
 # 🎯 MASTER ORCHESTRATOR
 # ============================================================================
 class MasterOrchestrator:
-    """Coordinates all guardians and manages the entire process"""
+    """Coordinates all guardians"""
     
-    def __init__(self, daily_goal: int):
+    def __init__(self, daily_goal: int, leads_worksheet, results_worksheet):
         self.duplicate_guardian = DuplicateGuardian()
         self.phone_guardian = PhoneSyncGuardian()
         self.preview_guardian = PreviewURLGuardian()
         self.data_guardian = DataIntegrityGuardian()
+        self.health_guardian = SystemHealthGuardian()
+        self.rate_limit_guardian = RateLimitGuardian()
+        self.backup_guardian = BackupGuardian()
         self.progress_tracker = ProgressTracker(daily_goal)
         self.rest_manager = RestManager(REST_AFTER_LEADS, REST_DURATION)
         
-        # Initialize phone map
+        self.leads_worksheet = leads_worksheet
+        self.results_worksheet = results_worksheet
+        
+        # Initialize
         self.phone_guardian.phase1_build_map(leads_worksheet)
+        self.health_guardian.check_health()
     
-    def process_lead_fully_supervised(self, lead: Dict, lead_row_index: int,
-                                      results_worksheet) -> bool:
-        """
-        Process a lead with COMPLETE supervision.
-        Returns True if processed successfully.
-        """
+    def process_lead_fully_supervised(self, lead: Dict, lead_row_index: int) -> bool:
+        """Process a lead with COMPLETE supervision"""
+        
         restaurant_name = str(lead.get("Restaurant Name", "")).strip()
         phone_raw = str(lead.get("Phone Number", "")).strip()
         target_url = lead.get("Website URL", "").strip()
@@ -798,24 +1040,19 @@ class MasterOrchestrator:
         LOGGER.log("MasterOrchestrator", "lead_start", TaskStatus.SUCCESS,
                    f"🎯 STARTING: {restaurant_name}")
         
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 1: PRE-PROCESSING CHECKS
-        # ═══════════════════════════════════════════════════════════════
+        # Rate limit check
+        self.rate_limit_guardian.wait_if_needed()
         
-        # Duplicate Check Phase 1
+        # Duplicate check Phase 1
         is_dup, reason = self.duplicate_guardian.phase1_check_before(
-            restaurant_name, phone_raw, results_worksheet
+            restaurant_name, phone_raw, self.results_worksheet
         )
         
         if is_dup:
-            LOGGER.log("MasterOrchestrator", "duplicate_blocked", TaskStatus.BLOCKED,
-                       f"Duplicate blocked at Phase 1: {reason}")
-            
             safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete - Duplicate"),
+                lambda: self.leads_worksheet.update_cell(lead_row_index, 6, "Complete - Duplicate"),
                 "Mark duplicate"
             )
-            
             self.progress_tracker.update(success=False, duplicate=True)
             return False
         
@@ -825,36 +1062,26 @@ class MasterOrchestrator:
         # Generate preview URL
         preview_url = self.preview_guardian.phase1_generate(restaurant_name)
         
-        # Mark as processing
+        # Mark processing
         try:
             safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, 
-                                                    f"Processing... {datetime.now().strftime('%H:%M:%S')}"),
+                lambda: self.leads_worksheet.update_cell(lead_row_index, 6, 
+                                                        f"Processing... {datetime.now().strftime('%H:%M:%S')}"),
                 "Mark processing"
             )
         except:
             pass
         
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 2: PROCESSING
-        # ═══════════════════════════════════════════════════════════════
-        
-        # Handle no website
+        # Process data
         if not target_url or target_url.lower() in ["no website found", "", "n/a"]:
             flaw_analysis = "No website found. Cannot perform analysis."
-            builder_prompt = "Create a modern, mobile-friendly website with contact info, menu, and SEO."
+            builder_prompt = "Create a modern, mobile-friendly website."
             ice_breaker = f"Hi, I noticed {restaurant_name} doesn't have a website—that's costing you 60%+ of customers. Preview: {preview_url} Can I show you how to launch in 24 hours?"
         else:
-            # Scrape and analyze (simplified - use your existing code)
-            try:
-                # Use your ScrapingSupervisor and AIAnalysisSupervisor here
-                flaw_analysis = f"Analysis for {restaurant_name}"  # Placeholder
-                ice_breaker = f"Quick note about {restaurant_name}. Preview: {preview_url}"
-                builder_prompt = "Template-based fixes"
-            except:
-                flaw_analysis = "Analysis failed"
-                ice_breaker = f"Preview: {preview_url}"
-                builder_prompt = "Template-based"
+            # Simplified - add your scraping/AI here
+            flaw_analysis = f"Website analysis for {restaurant_name}"
+            ice_breaker = f"Quick note about {restaurant_name}. Preview: {preview_url}"
+            builder_prompt = "Template-based fixes"
         
         # Ensure preview URL in ice breaker
         ice_breaker = self.preview_guardian.phase2_embed_in_icebreaker(ice_breaker, preview_url)
@@ -871,74 +1098,57 @@ class MasterOrchestrator:
             row_index=lead_row_index
         )
         
-        # Validate data structure
+        # Validate
         valid, issues = self.data_guardian.validate_row_structure(lead_data)
         if not valid:
-            LOGGER.log("MasterOrchestrator", "validation_failed", TaskStatus.FAILED,
-                       f"Data validation failed: {issues}")
             self.progress_tracker.update(success=False)
             return False
         
-        # Duplicate check Phase 2 (before save)
+        # Backup
+        self.backup_guardian.backup_lead_data(lead_data)
+        
+        # Duplicate check Phase 2
         is_dup, reason = self.duplicate_guardian.phase2_check_during(
-            restaurant_name, correct_phone, results_worksheet
+            restaurant_name, correct_phone, self.results_worksheet
         )
         
         if is_dup:
-            LOGGER.log("MasterOrchestrator", "duplicate_blocked_phase2", TaskStatus.BLOCKED,
-                       "Duplicate detected at Phase 2")
             safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete - Duplicate"),
+                lambda: self.leads_worksheet.update_cell(lead_row_index, 6, "Complete - Duplicate"),
                 "Mark duplicate"
             )
             self.progress_tracker.update(success=False, duplicate=True)
             return False
         
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 3: SAVING
-        # ═══════════════════════════════════════════════════════════════
-        
-        # Save to sheet
+        # Save
         try:
             safe_sheet_write(
-                lambda: results_worksheet.append_row(lead_data.to_sheet_row()),
+                lambda: self.results_worksheet.append_row(lead_data.to_sheet_row()),
                 "Save lead data"
             )
-            
-            LOGGER.log("MasterOrchestrator", "save_success", TaskStatus.SUCCESS,
-                       f"Saved {restaurant_name}")
-            
         except Exception as e:
             LOGGER.log("MasterOrchestrator", "save_failed", TaskStatus.CATASTROPHIC,
                        f"Save failed: {e}")
             self.progress_tracker.update(success=False)
             return False
         
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 4: POST-PROCESSING VERIFICATION
-        # ═══════════════════════════════════════════════════════════════
-        
-        # Verify no duplicates created
+        # Verify everything
         is_single, status = self.duplicate_guardian.phase3_verify_after(
-            restaurant_name, correct_phone, results_worksheet
+            restaurant_name, correct_phone, self.results_worksheet
         )
         
-        # Verify phone sync
         phone_synced = self.phone_guardian.phase3_verify_sync(
-            restaurant_name, correct_phone, results_worksheet
+            restaurant_name, correct_phone, self.results_worksheet
         )
         
-        # Verify preview URL
         url_verified = self.preview_guardian.phase3_verify_saved(
-            restaurant_name, preview_url, results_worksheet
+            restaurant_name, preview_url, self.results_worksheet
         )
         
-        # Verify column integrity
         columns_ok = self.data_guardian.verify_saved_columns(
-            restaurant_name, lead_data, results_worksheet
+            restaurant_name, lead_data, self.results_worksheet
         )
         
-        # Overall success
         all_verified = is_single and phone_synced and url_verified and columns_ok
         
         if all_verified:
@@ -946,7 +1156,7 @@ class MasterOrchestrator:
                        f"✅ FULLY VERIFIED: {restaurant_name}")
             
             safe_sheet_write(
-                lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
+                lambda: self.leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                 "Mark complete"
             )
             
@@ -954,57 +1164,43 @@ class MasterOrchestrator:
             self.rest_manager.increment()
             return True
         else:
-            LOGGER.log("MasterOrchestrator", "verification_issues", TaskStatus.FAILED,
-                       f"Verification incomplete for {restaurant_name}")
-            
             self.progress_tracker.update(success=False)
             return False
 
 # ============================================================================
-# [YOUR EXISTING HELPER FUNCTIONS]
-# ============================================================================
-# Add all your existing functions here:
-# - ask_ollama()
-# - verify_ollama()
-# - SheetsCache
-# - clean_html_aggressive()
-# - safe_sheet_read()
-# - safe_sheet_write()
-# - etc.
-
-# ============================================================================
-# MAIN PROCESSING LOOP
+# MAIN
 # ============================================================================
 def main():
-    """Main processing loop with full supervision"""
+    """Main loop"""
     
-    # Verify Ollama
     verify_ollama()
     
     print("\n" + "="*70)
     print("🚀 ULTRA-SUPERVISED LEAD PROCESSOR")
     print("="*70)
     print(f"💎 Model: {OLLAMA_MODEL}")
-    print(f"🛡️  6 Guardian Systems Active:")
+    print(f"🛡️  9 Guardian Systems Active:")
     print(f"   1. Duplicate Guardian (3-phase)")
     print(f"   2. Phone Sync Guardian (3-phase)")
     print(f"   3. Preview URL Guardian (3-phase)")
     print(f"   4. Data Integrity Guardian")
-    print(f"   5. Progress Tracker")
-    print(f"   6. Rest Manager")
+    print(f"   5. System Health Guardian")
+    print(f"   6. Rate Limit Guardian")
+    print(f"   7. Backup Guardian")
+    print(f"   8. Progress Tracker")
+    print(f"   9. Rest Manager")
     print(f"📊 Daily Goal: {MAX_LEADS_PER_DAY} leads")
-    print(f"😴 Rest: Every {REST_AFTER_LEADS} leads for {REST_DURATION/60:.0f} min")
     print(f"💰 Cost: ₹0 FOREVER!")
     print("="*70 + "\n")
     
-    # Initialize orchestrator
-    orchestrator = MasterOrchestrator(MAX_LEADS_PER_DAY)
+    orchestrator = MasterOrchestrator(MAX_LEADS_PER_DAY, leads_worksheet, results_worksheet)
     
     while True:
         try:
-            # Check if rest is needed
+            # Rest check
             if orchestrator.rest_manager.should_rest():
                 orchestrator.rest_manager.take_rest()
+                orchestrator.health_guardian.check_health()
             
             # Fetch leads
             all_leads = safe_sheet_read(
@@ -1013,7 +1209,6 @@ def main():
                 None
             )
             
-            # Process pending leads
             processed_this_cycle = False
             
             for idx, lead in enumerate(all_leads):
@@ -1023,18 +1218,17 @@ def main():
                     lead_row_index = idx + 2
                     
                     success = orchestrator.process_lead_fully_supervised(
-                        lead, lead_row_index, results_worksheet
+                        lead, lead_row_index
                     )
                     
                     processed_this_cycle = True
                     
-                    # Delay between leads
                     if success:
                         delay = random.randint(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
-                        print(f"⏸️  Waiting {delay}s before next lead...\n")
+                        print(f"⏸️  Waiting {delay}s...\n")
                         time.sleep(delay)
                     
-                    break  # Process one at a time
+                    break
             
             if not processed_this_cycle:
                 print("ℹ️  No pending leads. Waiting...")
@@ -1048,7 +1242,6 @@ def main():
             time.sleep(RETRY_DELAY_SECONDS)
 
 if __name__ == "__main__":
-    # Connect to sheets
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         creds_path = os.path.join(script_dir, 'gspread_credentials.json')
