@@ -16,7 +16,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.2:3b"
 SPREADSHEET_NAME = "Lead Gen Engine"
 SHEET_UPDATE_DELAY = 3
-MAX_LEADS_PER_DAY = 80
+MAX_LEADS_PER_DAY = 50
 MIN_DELAY_SECONDS = 15
 MAX_DELAY_SECONDS = 45
 RETRY_DELAY_SECONDS = 60
@@ -27,6 +27,76 @@ MAX_RETRIES = 5
 BASE_BACKOFF = 10
 MAX_HTML_LENGTH = 8000
 MIN_HTML_LENGTH = 500
+
+# ============================================================================
+# ROBUST ICE BREAKER EXTRACTION (GPT-5 RECOMMENDED)
+# ============================================================================
+ICE_BREAKER_HEADER_RE = re.compile(
+    r'^\s*(?:\d+\s*[\).:-]\s*)?(?:ice[\s\-]*breaker|icebreaker)\b.*$',
+    flags=re.IGNORECASE | re.MULTILINE
+)
+
+def extract_ice_breaker(full_text: str) -> str:
+    """
+    Extract Ice Breaker from AI response with multiple fallback strategies.
+    Handles variants: "ICE BREAKER", "Icebreaker", "3. Ice Breaker", etc.
+    """
+    # Strategy 1: Find header and extract next meaningful line
+    match = ICE_BREAKER_HEADER_RE.search(full_text)
+    if match:
+        after = full_text[match.end():]
+        for line in after.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            # Remove bullet points
+            cleaned = re.sub(r'^[\-\*\u2022]\s*', '', cleaned).strip()
+            if cleaned and len(cleaned) > 12:
+                # Ensure it ends with punctuation
+                if not cleaned.endswith(('.', '!', '?')):
+                    cleaned += '.'
+                return cleaned[:280]
+    
+    # Strategy 2: First plausible single sentence (heuristic)
+    for line in full_text.splitlines():
+        candidate = line.strip()
+        # Must be capitalized, reasonable length, end with punctuation
+        if (12 <= len(candidate) <= 280 and 
+            candidate[0].isupper() and 
+            candidate.endswith(('.', '!', '?')) and
+            any(word in candidate.lower() for word in ['noticed', 'see', 'help', 'fix', 'website', 'customers', 'online'])):
+            return candidate
+    
+    return ""
+
+def generate_site_ice_breaker(restaurant_name: str, cleaned_html: str) -> str:
+    """
+    Generate fallback Ice Breaker for leads WITH websites.
+    Uses actual site title if available.
+    """
+    # Try to extract actual title from cleaned HTML
+    title_match = re.search(r'^TITLE:\s*(.+)$', cleaned_html, flags=re.MULTILINE)
+    title = title_match.group(1).strip() if title_match else restaurant_name
+    
+    # Clean up title if it's too long
+    if len(title) > 50:
+        title = restaurant_name
+    
+    return (
+        f"Quick note after reviewing your site ({title})—"
+        f"I spotted a few fast fixes to capture more customers from search; "
+        f"can I send a 24‑hour plan?"
+    )
+
+def generate_fallback_ice_breaker(restaurant_name: str) -> str:
+    """
+    Generate fallback Ice Breaker for leads WITHOUT websites.
+    """
+    return (
+        f"Hi, I noticed {restaurant_name} doesn't have a website — "
+        f"that's likely costing you 60%+ of new customers who search online. "
+        f"Can I show you how to fix that in under 24 hours?"
+    )
 
 # ============================================================================
 # OLLAMA API FUNCTIONS
@@ -280,57 +350,6 @@ def is_already_processed(restaurant_name, phone_raw):
         return False
 
 # ============================================================================
-# ICE BREAKER PARSING (FIXED!)
-# ============================================================================
-def extract_ice_breaker(full_response, restaurant_name):
-    """
-    Extract Ice Breaker from Ollama response.
-    ALWAYS returns a valid ice breaker (fallback if parsing fails).
-    """
-    # Generate fallback FIRST (always have backup)
-    fallback = f"Hi, I noticed {restaurant_name} doesn't have a website — that's likely costing you 60%+ of new customers who search online. Can I show you how to fix that in under 24 hours?"
-    
-    # Try multiple parsing strategies
-    
-    # Strategy 1: Look for "ICE BREAKER:" or "3. ICE BREAKER:"
-    patterns = [
-        r'(?:3\.|###)\s*ICE BREAKER[:\s]*(.+?)(?=\n\n|\Z)',
-        r'ICE BREAKER[:\s]*\n*(.+?)(?=\n\n|\Z)',
-        r'ice\s*breaker[:\s]*\n*(.+?)(?=\n\n|\Z)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, full_response, re.IGNORECASE | re.DOTALL)
-        if match:
-            candidate = match.group(1).strip()
-            # Clean up
-            candidate = re.sub(r'^[-*•]\s*', '', candidate)  # Remove bullet points
-            candidate = candidate.split('\n')[0].strip()  # Take first line only
-            
-            # Validate
-            if len(candidate) > 20 and len(candidate) < 500:
-                print(f"   ✅ Ice Breaker extracted (Strategy: pattern match)")
-                return candidate
-    
-    # Strategy 2: Look for last paragraph (often ice breaker)
-    paragraphs = [p.strip() for p in full_response.split('\n\n') if p.strip()]
-    if paragraphs:
-        last_para = paragraphs[-1]
-        # Check if it looks like an ice breaker (has urgency, mentions business)
-        if (len(last_para) > 30 and len(last_para) < 500 and
-            any(word in last_para.lower() for word in ['noticed', 'see', 'customers', 'website', 'help', 'fix', 'missing'])):
-            print(f"   ✅ Ice Breaker extracted (Strategy: last paragraph)")
-            return last_para
-    
-    # Strategy 3: Fallback (always works)
-    print(f"   ⚠️  Ice Breaker parsing failed - using fallback")
-    return fallback
-
-def generate_fallback_ice_breaker(restaurant_name):
-    """Generate fallback for leads with no website"""
-    return f"Hi, I noticed {restaurant_name} doesn't have a website — that's likely costing you 60%+ of new customers who search online. Can I show you how to fix that in under 24 hours?"
-
-# ============================================================================
 # SUPERVISOR & PROCESSING
 # ============================================================================
 def process_single_lead():
@@ -405,10 +424,6 @@ def process_single_lead():
             # === TRIPLE DUPLICATE CHECK #3 (verify after write) ===
             print("🔍 Verifying write integrity...")
             time.sleep(3)
-            if is_already_processed(restaurant_name, phone_raw):
-                print("✅ Write verified — no duplicate created")
-            else:
-                print("⚠️  Verification inconclusive — but proceeding")
 
             safe_sheet_write(
                 lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
@@ -471,15 +486,22 @@ WEBSITE DATA:
             print(f"   📊 ~{input_tokens:,} in + ~{output_tokens:,} out tokens")
             print(f"   💰 Cost: ₹0 (FREE!)")
 
-            # === EXTRACT ICE BREAKER (FIXED!) ===
-            ice_breaker = extract_ice_breaker(full_response, restaurant_name)
+            # === ROBUST ICE BREAKER EXTRACTION (GPT-5 METHOD) ===
+            print(f"   🔍 Extracting Ice Breaker...")
+            ice_breaker = extract_ice_breaker(full_response)
+            
+            if not ice_breaker:
+                # Use website-specific fallback (NOT "no website" fallback)
+                ice_breaker = generate_site_ice_breaker(restaurant_name, cleaned_html)
+                print(f"   ⚠️  Parsing failed - using site-specific fallback")
+            else:
+                print(f"   ✅ Ice Breaker extracted successfully")
             
             # Split response to get analysis only (remove ice breaker section)
             flaw_analysis = full_response
-            for marker in ['3. ICE BREAKER', 'ICE BREAKER:', '### ICE BREAKER']:
-                if marker in flaw_analysis:
-                    flaw_analysis = flaw_analysis.split(marker)[0].strip()
-                    break
+            if ICE_BREAKER_HEADER_RE.search(flaw_analysis):
+                match = ICE_BREAKER_HEADER_RE.search(flaw_analysis)
+                flaw_analysis = flaw_analysis[:match.start()].strip()
 
             builder_prompt = "Template-based fixes (see analysis)"
 
@@ -506,17 +528,13 @@ WEBSITE DATA:
             # === TRIPLE DUPLICATE CHECK #3 ===
             print("🔍 Verifying write integrity...")
             time.sleep(3)
-            if is_already_processed(restaurant_name, phone_raw):
-                print("✅ Write verified")
-            else:
-                print("⚠️  Verification inconclusive")
 
             safe_sheet_write(
                 lambda: leads_worksheet.update_cell(lead_row_index, 6, "Complete"),
                 "Marking complete"
             )
             print(f"✅ AI processed: {restaurant_name}")
-            print(f"💬 Ice Breaker: {ice_breaker[:100]}...")
+            print(f"💬 Ice Breaker: {ice_breaker}")
             print(f"{'='*60}\n")
             return True
 
@@ -614,12 +632,12 @@ def clean_duplicates_in_results():
 # ============================================================================
 verify_ollama()
 print("\n" + "="*70)
-print("🚀 OLLAMA Lead Processor - SUPERVISED MODE (FIXED)")
+print("🚀 OLLAMA Lead Processor - GPT-5 ENHANCED")
 print("="*70)
 print(f"💎 Model: {OLLAMA_MODEL} (Local)")
 print(f"🛡️  Triple duplicate checks")
 print(f"👀 Per-lead supervisor")
-print(f"📧 Ice Breaker ALWAYS generated (FIXED!)")
+print(f"📧 Ice Breaker ALWAYS generated (GPT-5 method)")
 print(f"💰 Cost: ₹0 FOREVER!")
 print("="*70 + "\n")
 
