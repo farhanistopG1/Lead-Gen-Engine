@@ -13,7 +13,7 @@ import re
 GEMINI_API_KEY = "AIzaSyBzXE-mJpydq9jAsMiyspeTl_wKjwILs3I"
 SPREADSHEET_NAME = "Lead Gen Engine"
 SHEET_UPDATE_DELAY = 3
-MAX_LEADS_PER_DAY = 100
+MAX_LEADS_PER_DAY = 5
 
 # 🔥🔥🔥 CRITICAL: TIMING IN SECONDS NOT MINUTES! 🔥🔥🔥
 MIN_DELAY_SECONDS = 30   # 30-90 SECONDS between leads
