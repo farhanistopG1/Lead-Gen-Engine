@@ -56,7 +56,7 @@ Ollama
 
 ## Screenshots
 
-(Add screenshots here)
+Refer Asset section.
 
 ## Lessons Learned
 
